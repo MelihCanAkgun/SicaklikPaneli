@@ -7,6 +7,8 @@ namespace SicaklikPaneli;
 public sealed class DashboardForm : Form
 {
     public DashboardView View { get; }
+    public FanView Fans { get; }
+    private readonly PanelView[] _pages;
 
     public DashboardForm()
     {
@@ -19,14 +21,34 @@ public sealed class DashboardForm : Form
         Icon = CreateAppIcon(32);
 
         View = new DashboardView { Dock = DockStyle.Fill };
-        Controls.Add(View);
+        Fans = new FanView { Dock = DockStyle.Fill, Visible = false };
+        _pages = new PanelView[] { View, Fans };
+        for (int i = 0; i < _pages.Length; i++)
+        {
+            _pages[i].ActiveTab = i;
+            _pages[i].TabSelected += ShowPage;
+            Controls.Add(_pages[i]);
+        }
         ApplyScale();
+    }
+
+    public bool IsPageVisible(PanelView page) => Visible && page.Visible;
+
+    private void ShowPage(int index)
+    {
+        for (int i = 0; i < _pages.Length; i++) _pages[i].Visible = i == index;
+        _pages[index].Invalidate();
+    }
+
+    public void SetRtss(bool connected, bool installed)
+    {
+        foreach (var p in _pages) { p.RtssConnected = connected; p.RtssInstalled = installed; }
     }
 
     private void ApplyScale()
     {
         float scale = DeviceDpi / 96f;
-        ClientSize = new Size((int)(DashboardView.LogicalWidth * scale), (int)(DashboardView.LogicalHeight * scale));
+        ClientSize = new Size((int)(PanelView.LogicalWidth * scale), (int)(PanelView.LogicalHeight * scale));
     }
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)

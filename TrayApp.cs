@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
+using Microsoft.Win32;
 
 namespace SicaklikPaneli;
 
@@ -27,6 +29,11 @@ public sealed class TrayApp : ApplicationContext
     private volatile bool _rtssActive;
     private readonly bool _rtssInstalled = RtssOsd.FindExe() != null;
 
+    // Fan komutları arayüzden sensör iş parçacığına bu kuyrukla aktarılır (EC'ye tek yerden erişilir)
+    private readonly ConcurrentQueue<Action<FanController>> _fanCommands = new();
+    private readonly AutoResetEvent _wake = new(false);
+    private DateTime _lastHistory = DateTime.MinValue;
+
     private ToolStripMenuItem _modeAuto = null!, _modeAlways = null!, _modeOff = null!, _autostart = null!;
     private readonly Dictionary<Corner, ToolStripMenuItem> _cornerItems = new();
 
@@ -40,8 +47,10 @@ public sealed class TrayApp : ApplicationContext
         _dashboard = new DashboardForm();
         _dashboard.View.HistoryCapacity = HistorySeconds;
         _dashboard.View.Mode = _settings.Mode;
-        _dashboard.View.RtssInstalled = _rtssInstalled;
+        _dashboard.SetRtss(false, _rtssInstalled);
         _dashboard.View.ModeSelected += SetMode;
+        WireFanPage();
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
         _tray = new NotifyIcon { Visible = true, Text = "Sıcaklık Paneli – başlatılıyor…", ContextMenuStrip = BuildMenu() };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) _dashboard.ShowAndActivate(); };
@@ -64,20 +73,91 @@ public sealed class TrayApp : ApplicationContext
             _dashboard.Show();
     }
 
+    // ---------------- Fanlar ----------------
+
+    private void WireFanPage()
+    {
+        var fans = _dashboard.Fans;
+        fans.ProtectionEnabled = _settings.FanProtection;
+        fans.ProtectionTemp = _settings.FanProtectionTemp;
+
+        fans.ApplyRequested += (cpu, gpu) =>
+        {
+            _settings.FanStartup = FanStartup.Ozel;
+            _settings.CpuFanTemps = cpu.Temps; _settings.CpuFanSpeeds = cpu.Speeds;
+            _settings.GpuFanTemps = gpu.Temps; _settings.GpuFanSpeeds = gpu.Speeds;
+            _settings.Save();
+            FanCommand(f => f.ApplyCustom(cpu, gpu));
+        };
+        fans.AutoRequested += () =>
+        {
+            _settings.FanStartup = FanStartup.Otomatik;
+            _settings.Save();
+            FanCommand(f => f.SetAuto());
+        };
+        fans.BoostRequested += on => FanCommand(f => f.SetManualBoost(on));
+        fans.ProtectionChanged += (enabled, temp) =>
+        {
+            _settings.FanProtection = enabled;
+            _settings.FanProtectionTemp = temp;
+            _settings.Save();
+            _wake.Set();
+        };
+    }
+
+    private void FanCommand(Action<FanController> command)
+    {
+        _fanCommands.Enqueue(command);
+        _wake.Set();
+    }
+
+    /// <summary>Kayıtlı fan ayarını EC'ye yeniden yazar (program açılışında ve uykudan dönüşte).</summary>
+    private void ApplySavedFanSettings(FanController fan)
+    {
+        switch (_settings.FanStartup)
+        {
+            case FanStartup.Ozel when _settings is { CpuFanTemps: not null, CpuFanSpeeds: not null, GpuFanTemps: not null, GpuFanSpeeds: not null }:
+                fan.ApplyCustom(new FanCurve(_settings.CpuFanTemps, _settings.CpuFanSpeeds),
+                                new FanCurve(_settings.GpuFanTemps, _settings.GpuFanSpeeds));
+                break;
+            case FanStartup.Otomatik:
+                fan.SetAuto();
+                break;
+        }
+    }
+
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume) FanCommand(ApplySavedFanSettings);
+    }
+
     // ---------------- Sensör okuma (arka planda) ----------------
 
     private void SensorLoop(CancellationToken ct)
     {
         Sensors? sensors = null;
+        FanController? fan = null;
         try
         {
             sensors = new Sensors();
+            fan = new FanController();
+            if (fan.State.Available) ApplySavedFanSettings(fan);
+
+            var waitHandles = new[] { ct.WaitHandle, _wake };
             int tick = 0;
             while (!ct.IsCancellationRequested)
             {
+                while (_fanCommands.TryDequeue(out var command))
+                {
+                    try { command(fan); } catch { }
+                }
+
                 Snapshot snap;
                 try { snap = sensors.Read(); }
                 catch { snap = Snapshot.Empty; }
+
+                fan.Tick(snap.CpuTemp, snap.GpuTemp, _settings.FanProtection, _settings.FanProtectionTemp);
+                snap = snap with { Fan = fan.State };
 
                 // Oyun içi gösterge (RTSS): özel tam ekranda da görünür
                 if (_settings.Mode != PanelMode.Kapali)
@@ -93,7 +173,7 @@ public sealed class TrayApp : ApplicationContext
                 tick++;
 
                 _ui.Post(_ => OnData(snap), null);
-                ct.WaitHandle.WaitOne(1000);
+                WaitHandle.WaitAny(waitHandles, 1000);
             }
         }
         catch (Exception ex)
@@ -101,13 +181,22 @@ public sealed class TrayApp : ApplicationContext
             _ui.Post(_ => MessageBox.Show("Sensörler açılamadı:\n" + ex.Message, "Sıcaklık Paneli",
                 MessageBoxButtons.OK, MessageBoxIcon.Error), null);
         }
-        finally { sensors?.Dispose(); }
+        finally
+        {
+            fan?.Dispose();
+            sensors?.Dispose();
+        }
     }
 
     private void OnData(Snapshot s)
     {
-        _history.Add(s);
-        if (_history.Count > HistorySeconds) _history.RemoveAt(0);
+        // Fan komutları döngüyü erken uyandırabilir; geçmişe saniyede en fazla bir örnek ekle
+        if (DateTime.UtcNow - _lastHistory >= TimeSpan.FromMilliseconds(900))
+        {
+            _lastHistory = DateTime.UtcNow;
+            _history.Add(s);
+            if (_history.Count > HistorySeconds) _history.RemoveAt(0);
+        }
 
         UpdateTrayIcon(s);
         _overlay.SetData(s);
@@ -115,8 +204,10 @@ public sealed class TrayApp : ApplicationContext
         var view = _dashboard.View;
         view.Data = s;
         view.History = _history;
-        view.RtssConnected = _rtssActive;
-        if (_dashboard.Visible) view.Invalidate();
+        _dashboard.Fans.SetData(s);
+        _dashboard.SetRtss(_rtssActive, _rtssInstalled);
+        if (_dashboard.IsPageVisible(view)) view.Invalidate();
+        if (_dashboard.IsPageVisible(_dashboard.Fans)) _dashboard.Fans.Invalidate();
 
         static string Fmt(float? t, float? l, bool throttle) =>
             $"{(t.HasValue ? $"{t:0}°C" : "--")}  {(l.HasValue ? $"%{l:0}" : "")}{(throttle ? "  ⚠ kısıtlama" : "")}";
@@ -327,6 +418,7 @@ public sealed class TrayApp : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _cts.Cancel();
         _uiTimer.Stop();
         RtssOsd.Release();

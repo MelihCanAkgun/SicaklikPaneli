@@ -3,21 +3,6 @@ using LibreHardwareMonitor.Hardware;
 
 namespace SicaklikPaneli;
 
-public record Snapshot(float? CpuTemp, float? CpuLoad, float? GpuTemp, float? GpuLoad, string CpuName, string GpuName)
-{
-    public float? CpuPower { get; init; }      // W
-    public float? CpuClock { get; init; }      // MHz (en hızlı çekirdek)
-    public float? GpuPower { get; init; }      // W
-    public float? GpuMemUsed { get; init; }    // MB
-    public float? GpuMemTotal { get; init; }   // MB
-    public float? RamUsed { get; init; }       // GB
-    public float? RamTotal { get; init; }      // GB
-    public bool CpuThrottle { get; init; }
-    public bool GpuThrottle { get; init; }
-
-    public static readonly Snapshot Empty = new(null, null, null, null, "CPU", "GPU");
-}
-
 /// <summary>LibreHardwareMonitor üzerinden CPU/GPU sıcaklık ve kullanımını okur.</summary>
 public sealed class Sensors : IDisposable
 {
