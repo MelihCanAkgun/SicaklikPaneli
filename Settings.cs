@@ -23,6 +23,9 @@ public sealed class Settings
     public bool FanProtection { get; set; }          // sıcaklık eşiği aşılınca tam hız
     public int FanProtectionTemp { get; set; } = 90;
 
+    /// <summary>Program açılırken uygulanacak performans modu (null: dokunma).</summary>
+    public PerfMode? PerfStartup { get; set; }
+
     private static readonly string Dir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SicaklikPaneli");
     private static readonly string FilePath = Path.Combine(Dir, "ayarlar.json");

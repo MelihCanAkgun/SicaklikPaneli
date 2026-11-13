@@ -16,6 +16,7 @@ public sealed class FanController : IDisposable
     private const byte AddrFirmware = 0xA0, AddrFanMode = 0xF4, AddrBoost = 0x98,
                        AddrCpuTemps = 0x6A, AddrCpuSpeeds = 0x72, AddrGpuTemps = 0x82, AddrGpuSpeeds = 0x8A,
                        AddrCpuPercent = 0x71, AddrGpuPercent = 0x89, AddrGpuRpm = 0xCA, AddrCpuRpm = 0xCC;
+    private const byte AddrShift = 0xF2, ShiftTurbo = 0xC4, ShiftSport = 0xC0, ShiftComfort = 0xC1, ShiftEco = 0xC2;
     private const byte ModeMask = 0xC0, ModeAuto = 0x00, ModeBasic = 0x40, ModeAdvanced = 0x80, BoostBit = 0x80;
 
     /// <summary>Aynı adres düzenini kullanan bellenim aileleri.</summary>
@@ -235,6 +236,34 @@ public sealed class FanController : IDisposable
         catch (Exception ex) { _state = _state with { Message = "Yazma hatası: " + ex.Message }; return false; }
     }
 
+    /// <summary>Performans modunu (MSI Shift) değiştirir. Yalnızca kayıt bilinen bir değerdeyse yazar.</summary>
+    public bool SetPerfMode(PerfMode mode)
+    {
+        if (_ec == null) return false;
+        try
+        {
+            byte? value = mode switch { PerfMode.Turbo => ShiftTurbo, PerfMode.Dengeli => ShiftComfort, _ => null };
+            if (value == null || ToPerfMode(Read(AddrShift)) == PerfMode.Bilinmiyor)
+            {
+                _state = _state with { Message = "Performans modu bu cihazda değiştirilemiyor." };
+                return false;
+            }
+            bool ok = Write(AddrShift, value.Value);
+            RefreshStatus(ok ? $"Performans modu: {mode}." : "Performans modu değiştirilemedi.");
+            return ok;
+        }
+        catch (Exception ex) { _state = _state with { Message = "Yazma hatası: " + ex.Message }; return false; }
+    }
+
+    private static PerfMode ToPerfMode(byte raw) => raw switch
+    {
+        ShiftTurbo => PerfMode.Turbo,
+        ShiftSport => PerfMode.Sport,
+        ShiftComfort => PerfMode.Dengeli,
+        ShiftEco => PerfMode.Eco,
+        _ => PerfMode.Bilinmiyor
+    };
+
     private bool SetMode(byte mode) => Write(AddrFanMode, (byte)((Read(AddrFanMode) & ~ModeMask) | mode));
 
     private bool SetBoostBit(bool on)
@@ -292,6 +321,7 @@ public sealed class FanController : IDisposable
             GpuRpm = ReadRpm(AddrGpuRpm),
             Boost = (Read(AddrBoost) & BoostBit) != 0,
             AutoBoostActive = _autoBoost,
+            Perf = ToPerfMode(Read(AddrShift)),
             Mode = mode switch
             {
                 ModeAuto => FanEcMode.Otomatik,

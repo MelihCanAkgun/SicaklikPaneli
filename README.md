@@ -6,6 +6,7 @@ Windows için küçük bir işlemci / ekran kartı izleme programı.
 - **Ana pencere:** İşlemci ve ekran kartı için sıcaklık, kullanım, güç tüketimi, frekans ve VRAM; son 3 dakikanın sıcaklık grafiği ve bellek kullanımı.
 - **Oyun paneli:** Tam ekran bir oyun açıldığında işlemci ve ekran kartının sıcaklığını ve kullanımını gösteren küçük bir panel belirir.
 - **Fan denetimi (MSI dizüstüler):** Fan devrini izleme, sürüklenebilir fan eğrisi, tam hız (Cooler Boost) ve sıcaklık eşiği aşılınca fanları otomatik tam hıza alan koruma.
+- **Performans modu (MSI dizüstüler):** Turbo ve Dengeli arasında geçiş; MSI'ın performans seviyesini (Shift) ve Windows güç planını birlikte değiştirir.
 - **Isıl kısıtlama uyarısı:** İşlemci ya da ekran kartı ısıdan dolayı hız kestiğinde (thermal throttling) panelde uyarı işareti çıkar.
 
 ```

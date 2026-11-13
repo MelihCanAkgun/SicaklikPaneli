@@ -34,7 +34,8 @@ public sealed class TrayApp : ApplicationContext
     private readonly AutoResetEvent _wake = new(false);
     private DateTime _lastHistory = DateTime.MinValue;
 
-    private ToolStripMenuItem _modeAuto = null!, _modeAlways = null!, _modeOff = null!, _autostart = null!;
+    private ToolStripMenuItem _modeAuto = null!, _modeAlways = null!, _modeOff = null!, _autostart = null!,
+                              _perfTurbo = null!, _perfBalanced = null!;
     private readonly Dictionary<Corner, ToolStripMenuItem> _cornerItems = new();
 
     public TrayApp()
@@ -49,6 +50,7 @@ public sealed class TrayApp : ApplicationContext
         _dashboard.View.Mode = _settings.Mode;
         _dashboard.SetRtss(false, _rtssInstalled);
         _dashboard.View.ModeSelected += SetMode;
+        _dashboard.View.PerfSelected += SetPerfMode;
         WireFanPage();
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
@@ -105,6 +107,15 @@ public sealed class TrayApp : ApplicationContext
         };
     }
 
+    /// <summary>Performans modu: EC'deki MSI Shift modu + uygun Windows güç planı.</summary>
+    private void SetPerfMode(PerfMode mode)
+    {
+        _settings.PerfStartup = mode;
+        _settings.Save();
+        FanCommand(f => f.SetPerfMode(mode));
+        Task.Run(() => PowerPlan.Apply(mode));
+    }
+
     private void FanCommand(Action<FanController> command)
     {
         _fanCommands.Enqueue(command);
@@ -114,6 +125,8 @@ public sealed class TrayApp : ApplicationContext
     /// <summary>Kayıtlı fan ayarını EC'ye yeniden yazar (program açılışında ve uykudan dönüşte).</summary>
     private void ApplySavedFanSettings(FanController fan)
     {
+        if (_settings.PerfStartup is PerfMode perf) fan.SetPerfMode(perf);
+
         switch (_settings.FanStartup)
         {
             case FanStartup.Ozel when _settings is { CpuFanTemps: not null, CpuFanSpeeds: not null, GpuFanTemps: not null, GpuFanSpeeds: not null }:
@@ -200,6 +213,9 @@ public sealed class TrayApp : ApplicationContext
 
         UpdateTrayIcon(s);
         _overlay.SetData(s);
+        _perfTurbo.Checked = s.Fan.Perf == PerfMode.Turbo;
+        _perfBalanced.Checked = s.Fan.Perf == PerfMode.Dengeli;
+        _perfTurbo.Enabled = _perfBalanced.Enabled = s.Fan.Available && s.Fan.Perf != PerfMode.Bilinmiyor;
 
         var view = _dashboard.View;
         view.Data = s;
@@ -349,6 +365,11 @@ public sealed class TrayApp : ApplicationContext
         _modeAlways.Checked = _settings.Mode == PanelMode.HerZaman;
         _modeOff.Checked = _settings.Mode == PanelMode.Kapali;
 
+        var perf = new ToolStripMenuItem("Performans modu");
+        _perfTurbo = new ToolStripMenuItem("Turbo", null, (_, _) => SetPerfMode(PerfMode.Turbo));
+        _perfBalanced = new ToolStripMenuItem("Dengeli", null, (_, _) => SetPerfMode(PerfMode.Dengeli));
+        perf.DropDownItems.AddRange([_perfTurbo, _perfBalanced]);
+
         var corner = new ToolStripMenuItem("Panel konumu");
         foreach (var (c, label) in new[] { (Corner.SolUst, "Sol üst"), (Corner.SagUst, "Sağ üst"),
                                            (Corner.SolAlt, "Sol alt"), (Corner.SagAlt, "Sağ alt") })
@@ -374,7 +395,7 @@ public sealed class TrayApp : ApplicationContext
 
         menu.Items.Add(open);
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.AddRange([panel, corner, opacity, _autostart]);
+        menu.Items.AddRange([perf, panel, corner, opacity, _autostart]);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Çıkış", null, (_, _) => ExitThread());
         return menu;

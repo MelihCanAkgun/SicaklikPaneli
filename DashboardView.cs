@@ -13,6 +13,7 @@ public sealed class DashboardView : PanelView
     public PanelMode Mode = PanelMode.Otomatik;
 
     public event Action<PanelMode>? ModeSelected;
+    public event Action<PerfMode>? PerfSelected;
 
     private static readonly (PanelMode mode, string text)[] Segments =
     {
@@ -207,16 +208,27 @@ public sealed class DashboardView : PanelView
 
     private void DrawFooter(Graphics g)
     {
-        DrawLabel(g, "OYUN PANELİ", 22, 553);
+        // Performans modu (MSI Shift)
+        var fan = Data.Fan;
+        bool canSwitch = fan.Available && fan.Perf != PerfMode.Bilinmiyor;
+        DrawLabel(g, "PERFORMANS", 22, 553);
+        Button(g, new RectangleF(124, 544, 92, 34), "Turbo", fan.Perf == PerfMode.Turbo,
+            () => PerfSelected?.Invoke(PerfMode.Turbo), enabled: canSwitch);
+        Button(g, new RectangleF(220, 544, 92, 34), "Dengeli", fan.Perf == PerfMode.Dengeli,
+            () => PerfSelected?.Invoke(PerfMode.Dengeli), enabled: canSwitch, activeColor: Color.FromArgb(52, 96, 150));
+        if (fan.Perf is PerfMode.Sport or PerfMode.Eco)
+        {
+            using var font = Theme.Font(12);
+            using var muted = new SolidBrush(Theme.Muted);
+            g.DrawString($"şu an: {fan.Perf}", font, muted, 320, 553);
+        }
+
+        // Oyun paneli modu
+        DrawLabel(g, "OYUN PANELİ", 448, 553);
         for (int i = 0; i < Segments.Length; i++)
         {
             var (mode, text) = Segments[i];
-            Button(g, new RectangleF(150 + i * 112, 544, 108, 34), text, mode == Mode, () => ModeSelected?.Invoke(mode));
+            Button(g, new RectangleF(548 + i * 98, 544, 94, 34), text, mode == Mode, () => ModeSelected?.Invoke(mode));
         }
-
-        using var font = Theme.Font(13);
-        using var muted = new SolidBrush(Theme.Muted);
-        using var far = new StringFormat { Alignment = StringAlignment.Far };
-        g.DrawString("Kısayol: Ctrl + Shift + F10", font, muted, new RectangleF(540, 552, 300, 20), far);
     }
 }
