@@ -84,6 +84,8 @@ public static class GpuOverclock
                 rc = _get!(_gpu, buf);
                 if (rc == 0) { _version = version; break; }
             }
+            // -220: Optimus dizüstülerde ekran kartı kullanılmadığında uykuya geçer
+            if (rc == -220) return OcState.Unavailable("Ekran kartı şu an uykuda. Bir oyun açıkken bu sayfaya tekrar bak.");
             if (rc != 0) return OcState.Unavailable($"Hız aşırtma bilgisi okunamadı ({rc}).");
 
             int numPstates = Marshal.ReadInt32(buf, OffNumPstates);
