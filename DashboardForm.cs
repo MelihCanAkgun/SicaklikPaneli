@@ -8,6 +8,7 @@ public sealed class DashboardForm : Form
 {
     public DashboardView View { get; }
     public FanView Fans { get; }
+    public PerfView Perf { get; }
     private readonly PanelView[] _pages;
 
     public DashboardForm()
@@ -22,7 +23,8 @@ public sealed class DashboardForm : Form
 
         View = new DashboardView { Dock = DockStyle.Fill };
         Fans = new FanView { Dock = DockStyle.Fill, Visible = false };
-        _pages = new PanelView[] { View, Fans };
+        Perf = new PerfView { Dock = DockStyle.Fill, Visible = false };
+        _pages = new PanelView[] { View, Fans, Perf };
         for (int i = 0; i < _pages.Length; i++)
         {
             _pages[i].ActiveTab = i;

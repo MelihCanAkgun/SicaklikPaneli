@@ -52,6 +52,7 @@ public sealed class TrayApp : ApplicationContext
         _dashboard.View.ModeSelected += SetMode;
         _dashboard.View.PerfSelected += SetPerfMode;
         WireFanPage();
+        WireOcPage();
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
         _tray = new NotifyIcon { Visible = true, Text = "Sıcaklık Paneli – başlatılıyor…", ContextMenuStrip = BuildMenu() };
@@ -107,6 +108,67 @@ public sealed class TrayApp : ApplicationContext
         };
     }
 
+    // ---------------- Ekran kartı hız aşırtma ----------------
+
+    private void WireOcPage()
+    {
+        var perf = _dashboard.Perf;
+        perf.PerfSelected += SetPerfMode;
+        perf.OcRequested += ApplyOc;
+        perf.CoreTarget = Math.Clamp(_settings.GpuOcCore, 0, PerfView.CoreLimit);
+        perf.MemoryTarget = Math.Clamp(_settings.GpuOcMemory, 0, PerfView.MemoryLimit);
+        perf.Oc = GpuOverclock.Read();
+
+        if (_settings.GpuOcEnabled)
+        {
+            if (_settings.GpuOcCleanExit)
+                ApplyOc(true, perf.CoreTarget, perf.MemoryTarget);
+            else
+            {
+                // Önceki oturum hız aşırtma açıkken düzgün kapanmadı (çökme olabilir): yeniden uygulama
+                _settings.GpuOcEnabled = false;
+                _settings.GpuOcCleanExit = true;
+                _settings.Save();
+                perf.Message = "Önceki oturum düzgün kapanmadığı için hız aşırtma güvenlik amacıyla kapatıldı.";
+            }
+        }
+        SystemEvents.SessionEnding += (_, _) => ResetOcOnExit();
+    }
+
+    private void ApplyOc(bool enabled, int core, int memory)
+    {
+        var perf = _dashboard.Perf;
+        core = Math.Clamp(core, 0, PerfView.CoreLimit);
+        memory = Math.Clamp(memory, 0, PerfView.MemoryLimit);
+
+        bool ok = GpuOverclock.Apply(enabled ? core : 0, enabled ? memory : 0, out string error);
+        bool active = ok && enabled;
+
+        _settings.GpuOcEnabled = active;
+        _settings.GpuOcCore = core;
+        _settings.GpuOcMemory = memory;
+        _settings.GpuOcCleanExit = !active; // açıkken "temiz kapanmadı" say; kapanışta düzeltilir
+        _settings.Save();
+
+        perf.Oc = GpuOverclock.Read();
+        perf.OcEnabled = active;
+        perf.Message = !ok ? "Hız aşırtma uygulanamadı: " + error
+                     : enabled ? $"Hız aşırtma uygulandı: çekirdek +{core} MHz, bellek +{memory} MHz."
+                     : "Hız aşırtma kapatıldı.";
+        perf.Invalidate();
+    }
+
+    /// <summary>Program ya da Windows kapanırken ofsetleri sıfırlar ve oturumu "temiz" olarak işaretler.</summary>
+    private void ResetOcOnExit()
+    {
+        if (_settings.GpuOcEnabled) GpuOverclock.Apply(0, 0, out _);
+        if (!_settings.GpuOcCleanExit)
+        {
+            _settings.GpuOcCleanExit = true;
+            _settings.Save();
+        }
+    }
+
     /// <summary>Performans modu: EC'deki MSI Shift modu + uygun Windows güç planı.</summary>
     private void SetPerfMode(PerfMode mode)
     {
@@ -141,7 +203,10 @@ public sealed class TrayApp : ApplicationContext
 
     private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
     {
-        if (e.Mode == PowerModes.Resume) FanCommand(ApplySavedFanSettings);
+        if (e.Mode != PowerModes.Resume) return;
+        FanCommand(ApplySavedFanSettings);
+        // Sürücü uykudan dönüşte ofsetleri sıfırlayabilir; açıksa yeniden uygula
+        _ui.Post(_ => { if (_settings.GpuOcEnabled) ApplyOc(true, _settings.GpuOcCore, _settings.GpuOcMemory); }, null);
     }
 
     // ---------------- Sensör okuma (arka planda) ----------------
@@ -224,6 +289,14 @@ public sealed class TrayApp : ApplicationContext
         _dashboard.SetRtss(_rtssActive, _rtssInstalled);
         if (_dashboard.IsPageVisible(view)) view.Invalidate();
         if (_dashboard.IsPageVisible(_dashboard.Fans)) _dashboard.Fans.Invalidate();
+
+        var perf = _dashboard.Perf;
+        perf.Data = s;
+        if (_dashboard.IsPageVisible(perf))
+        {
+            if (_readCount % 10 == 0) perf.Oc = GpuOverclock.Read(); // sürücü ofseti sıfırlamış olabilir
+            perf.Invalidate();
+        }
 
         static string Fmt(float? t, float? l, bool throttle) =>
             $"{(t.HasValue ? $"{t:0}°C" : "--")}  {(l.HasValue ? $"%{l:0}" : "")}{(throttle ? "  ⚠ kısıtlama" : "")}";
@@ -440,6 +513,7 @@ public sealed class TrayApp : ApplicationContext
     protected override void ExitThreadCore()
     {
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        ResetOcOnExit();
         _cts.Cancel();
         _uiTimer.Stop();
         RtssOsd.Release();

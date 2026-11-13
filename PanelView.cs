@@ -10,7 +10,7 @@ namespace SicaklikPaneli;
 public abstract class PanelView : Control
 {
     public const int LogicalWidth = 860, LogicalHeight = 600;
-    public static readonly string[] Tabs = { "GENEL", "FANLAR" };
+    public static readonly string[] Tabs = { "GENEL", "FANLAR", "PERFORMANS" };
 
     public int ActiveTab;
     public bool RtssConnected, RtssInstalled;

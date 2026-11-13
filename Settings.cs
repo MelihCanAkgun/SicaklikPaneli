@@ -26,6 +26,13 @@ public sealed class Settings
     /// <summary>Program açılırken uygulanacak performans modu (null: dokunma).</summary>
     public PerfMode? PerfStartup { get; set; }
 
+    // Ekran kartı hız aşırtma (MHz)
+    public bool GpuOcEnabled { get; set; }
+    public int GpuOcCore { get; set; }
+    public int GpuOcMemory { get; set; }
+    /// <summary>Hız aşırtma açıkken program düzgün kapanmazsa false kalır; sonraki açılışta aşırtma uygulanmaz.</summary>
+    public bool GpuOcCleanExit { get; set; } = true;
+
     private static readonly string Dir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SicaklikPaneli");
     private static readonly string FilePath = Path.Combine(Dir, "ayarlar.json");
