@@ -26,8 +26,25 @@ public static class Theme
         _ => Warning
     };
 
-    public static Font Font(float px, bool bold = false, string family = "Segoe UI") =>
-        new(family, px, bold ? FontStyle.Bold : FontStyle.Regular, GraphicsUnit.Pixel);
+    /// <summary>Metin yazı tipi: Segoe UI; vurgulu metinler kalın yerine yarı kalın (Semibold).</summary>
+    public static Font Font(float px, bool semibold = false) =>
+        new(semibold ? SemiboldFamily : "Segoe UI", px, FontStyle.Regular, GraphicsUnit.Pixel);
+
+    /// <summary>Sayılar için dar ve düzgün rakamlı Bahnschrift (yoksa Segoe UI Semibold).</summary>
+    public static Font Number(float px) => new(NumberFamily, px, FontStyle.Regular, GraphicsUnit.Pixel);
+
+    /// <summary>Yazının üst kenarından taban çizgisine uzaklık; farklı yazı tiplerini aynı satırda hizalamak için.</summary>
+    public static float Ascent(Font f) =>
+        f.Size * f.FontFamily.GetCellAscent(f.Style) / f.FontFamily.GetEmHeight(f.Style);
+
+    private static readonly string SemiboldFamily = Installed("Segoe UI Semibold") ? "Segoe UI Semibold" : "Segoe UI";
+    private static readonly string NumberFamily = Installed("Bahnschrift SemiBold") ? "Bahnschrift SemiBold" : SemiboldFamily;
+
+    private static bool Installed(string family)
+    {
+        using var fonts = new System.Drawing.Text.InstalledFontCollection();
+        return fonts.Families.Any(f => f.Name.Equals(family, StringComparison.OrdinalIgnoreCase));
+    }
 
     public static GraphicsPath RoundedRect(RectangleF r, float radius)
     {

@@ -1,6 +1,6 @@
 namespace SicaklikPaneli;
 
-/// <summary>"PERFORMANS" sayfası: performans modu ve ekran kartı hız aşırtma.</summary>
+/// <summary>"Performans" sayfası: performans modu ve ekran kartı hız aşırtma.</summary>
 public sealed class PerfView : PanelView
 {
     // Güvenli tarafta kalmak için sürücünün izin verdiğinden çok daha dar sınırlar
@@ -36,7 +36,7 @@ public sealed class PerfView : PanelView
     private void DrawModeCard(Graphics g, RectangleF r)
     {
         DrawCard(g, r);
-        DrawLabel(g, "PERFORMANS MODU", r.X + 18, r.Y + 14);
+        DrawLabel(g, "Performans modu", r.X + 18, r.Y + 14);
         var fan = Data.Fan;
         bool canSwitch = fan.Available && fan.Perf != PerfMode.Bilinmiyor;
 
@@ -79,7 +79,7 @@ public sealed class PerfView : PanelView
             using var badge = Theme.Font(11, true);
             using var cb = new SolidBrush(color);
             using var far = new StringFormat { Alignment = StringAlignment.Far };
-            g.DrawString("ETKİN", badge, cb, new RectangleF(rect.X, rect.Y + 17, rect.Width - 16, 16), far);
+            g.DrawString("Etkin", badge, cb, new RectangleF(rect.X, rect.Y + 17, rect.Width - 16, 16), far);
         }
         if (enabled) Hit(rect, () => PerfSelected?.Invoke(mode));
     }
@@ -89,7 +89,7 @@ public sealed class PerfView : PanelView
     private void DrawOcCard(Graphics g, RectangleF r)
     {
         DrawCard(g, r);
-        DrawLabel(g, "EKRAN KARTI HIZ AŞIRTMA", r.X + 18, r.Y + 16);
+        DrawLabel(g, "Ekran kartı hız aşırtma", r.X + 18, r.Y + 16);
         using var font = Theme.Font(12);
         using var muted = new SolidBrush(Theme.Muted);
         using var text = new SolidBrush(Theme.Text);
@@ -113,13 +113,13 @@ public sealed class PerfView : PanelView
 
         // Ayar satırları (sol)
         float left = r.X + 18, rowW = 470;
-        DrawClockRow(g, left, r.Y + 56, rowW, "ÇEKİRDEK SAATİ", CoreTarget, CoreMax, CoreStep, Oc.Core.OffsetMhz, Theme.Gpu,
+        DrawClockRow(g, left, r.Y + 56, rowW, "Çekirdek saati", CoreTarget, CoreMax, CoreStep, Oc.Core.OffsetMhz, Theme.Gpu,
             v => CoreTarget = v);
-        DrawClockRow(g, left, r.Y + 132, rowW, "BELLEK SAATİ", MemoryTarget, MemoryMax, MemoryStep, Oc.Memory.OffsetMhz, Theme.Cpu,
+        DrawClockRow(g, left, r.Y + 132, rowW, "Bellek saati", MemoryTarget, MemoryMax, MemoryStep, Oc.Memory.OffsetMhz, Theme.Cpu,
             v => MemoryTarget = v);
 
         // Hazır ayarlar + uygula
-        DrawLabel(g, "HAZIR AYARLAR", left, r.Y + 216);
+        DrawLabel(g, "Hazır ayarlar", left, r.Y + 216);
         for (int i = 0; i < Presets.Length; i++)
         {
             var p = Presets[i];
@@ -154,7 +154,7 @@ public sealed class PerfView : PanelView
         int applied, Color color, Action<int> set)
     {
         using var labelFont = Theme.Font(11, true);
-        using var valueFont = Theme.Font(20, true);
+        using var valueFont = Theme.Number(22);
         using var small = Theme.Font(11);
         using var muted = new SolidBrush(Theme.Muted);
         using var text = new SolidBrush(max > 0 ? Theme.Text : Theme.Muted);

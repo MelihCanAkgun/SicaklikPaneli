@@ -1,4 +1,4 @@
-# Sıcaklık Paneli
+# Dragon Saj
 
 Windows için küçük bir işlemci / ekran kartı izleme programı.
 
@@ -30,7 +30,7 @@ Program sensörlere erişebilmek için yönetici izniyle çalışır.
 dotnet build -c Release
 ```
 
-Çıktı: `bin\Release\net9.0-windows\win-x64\SicaklikPaneli.exe`
+Çıktı: `bin\Release\net9.0-windows\win-x64\DragonSaj.exe`
 
 ## Kullanım
 

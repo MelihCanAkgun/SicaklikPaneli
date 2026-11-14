@@ -10,7 +10,8 @@ namespace SicaklikPaneli;
 /// </summary>
 public sealed class TrayApp : ApplicationContext
 {
-    private const string TaskName = "SicaklikPaneli";
+    private const string TaskName = "DragonSaj";
+    private const string OldTaskName = "SicaklikPaneli"; // eski sürümün otomatik başlatma görevi
     private const int HotkeyId = 1;
     private const int HistorySeconds = 180;
 
@@ -41,6 +42,7 @@ public sealed class TrayApp : ApplicationContext
     public TrayApp()
     {
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        MigrateAutostart();
 
         _overlay = new OverlayForm { Opacity = Math.Clamp(_settings.Opacity, 20, 99) / 100.0 };
         _ = _overlay.Handle; // pencere tutamacını oluştur (gizli)
@@ -55,7 +57,7 @@ public sealed class TrayApp : ApplicationContext
         WireOcPage();
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
-        _tray = new NotifyIcon { Visible = true, Text = "Sıcaklık Paneli – başlatılıyor…", ContextMenuStrip = BuildMenu() };
+        _tray = new NotifyIcon { Visible = true, Text = "Dragon Saj – başlatılıyor…", ContextMenuStrip = BuildMenu() };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) _dashboard.ShowAndActivate(); };
         UpdateTrayIcon(null);
 
@@ -256,7 +258,7 @@ public sealed class TrayApp : ApplicationContext
         }
         catch (Exception ex)
         {
-            _ui.Post(_ => MessageBox.Show("Sensörler açılamadı:\n" + ex.Message, "Sıcaklık Paneli",
+            _ui.Post(_ => MessageBox.Show("Sensörler açılamadı:\n" + ex.Message, "Dragon Saj",
                 MessageBoxButtons.OK, MessageBoxIcon.Error), null);
         }
         finally
@@ -426,7 +428,7 @@ public sealed class TrayApp : ApplicationContext
     {
         var menu = new ContextMenuStrip();
 
-        var open = new ToolStripMenuItem("Sıcaklık Paneli'ni aç", null, (_, _) => _dashboard.ShowAndActivate());
+        var open = new ToolStripMenuItem("Dragon Saj'ı aç", null, (_, _) => _dashboard.ShowAndActivate());
         open.Font = new Font(open.Font, FontStyle.Bold);
 
         var panel = new ToolStripMenuItem("Oyun paneli");
@@ -478,18 +480,24 @@ public sealed class TrayApp : ApplicationContext
 
     private static bool IsAutostartEnabled() => RunSchtasks($"/query /tn \"{TaskName}\"") == 0;
 
+    private static int CreateAutostartTask() =>
+        RunSchtasks($"/create /tn \"{TaskName}\" /tr \"\\\"{Environment.ProcessPath}\\\" --gizli\" /sc onlogon /rl highest /f");
+
+    /// <summary>Eski adla (Sıcaklık Paneli) kurulmuş otomatik başlatma görevini yeni ada ve exe'ye taşır.</summary>
+    private static void MigrateAutostart()
+    {
+        if (RunSchtasks($"/query /tn \"{OldTaskName}\"") != 0) return;
+        if (CreateAutostartTask() == 0)
+            RunSchtasks($"/delete /tn \"{OldTaskName}\" /f");
+    }
+
     private void ToggleAutostart()
     {
-        int rc;
-        if (IsAutostartEnabled())
-            rc = RunSchtasks($"/delete /tn \"{TaskName}\" /f");
-        else
-        {
-            string exe = Environment.ProcessPath!;
-            rc = RunSchtasks($"/create /tn \"{TaskName}\" /tr \"\\\"{exe}\\\" --gizli\" /sc onlogon /rl highest /f");
-        }
+        int rc = IsAutostartEnabled()
+            ? RunSchtasks($"/delete /tn \"{TaskName}\" /f")
+            : CreateAutostartTask();
         if (rc != 0)
-            MessageBox.Show("Otomatik başlatma ayarı değiştirilemedi.", "Sıcaklık Paneli", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show("Otomatik başlatma ayarı değiştirilemedi.", "Dragon Saj", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         _autostart.Checked = IsAutostartEnabled();
     }
 

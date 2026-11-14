@@ -1,4 +1,3 @@
-using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
 
 namespace SicaklikPaneli;
@@ -13,13 +12,13 @@ public sealed class DashboardForm : Form
 
     public DashboardForm()
     {
-        Text = "Sıcaklık Paneli";
+        Text = "Dragon Saj";
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Theme.Background;
         AutoScaleMode = AutoScaleMode.None;
-        Icon = CreateAppIcon(32);
+        Icon = DragonLogo.LoadIcon();
 
         View = new DashboardView { Dock = DockStyle.Fill };
         Fans = new FanView { Dock = DockStyle.Fill, Visible = false };
@@ -82,24 +81,6 @@ public sealed class DashboardForm : Form
         if (!Visible) Show();
         if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
         Activate();
-    }
-
-    /// <summary>Pencere simgesi: koyu zemin üzerinde kırmızı gösterge yayı.</summary>
-    public static Icon CreateAppIcon(int size)
-    {
-        using var bmp = new Bitmap(size, size);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            Theme.FillRounded(g, Color.FromArgb(27, 27, 32), new RectangleF(0, 0, size, size), size * 0.22f);
-            float pad = size * 0.2f, th = size * 0.12f;
-            var rect = new RectangleF(pad, pad, size - 2 * pad, size - 2 * pad);
-            using var track = new Pen(Theme.Track, th) { StartCap = LineCap.Round, EndCap = LineCap.Round };
-            using var arc = new Pen(Theme.Accent, th) { StartCap = LineCap.Round, EndCap = LineCap.Round };
-            g.DrawArc(track, rect, 135, 270);
-            g.DrawArc(arc, rect, 135, 190);
-        }
-        return Icon.FromHandle(bmp.GetHicon());
     }
 
     [DllImport("dwmapi.dll")]

@@ -1,0 +1,125 @@
+using System.Drawing.Drawing2D;
+
+namespace SicaklikPaneli;
+
+/// <summary>
+/// Dragon Saj logosu: kanatları kırılmış, gözleri çarpı, dili dışarıda, kafasını yere koymuş kırmızı bir
+/// ejderha (pixel art). Uygulama simgesi (DragonSaj.ico, tools/IconGen ile üretilir) ve pencere başlığındaki
+/// logo aynı piksel verisinden çizilir.
+/// </summary>
+public static class DragonLogo
+{
+    private static readonly Dictionary<char, Color> Palette = new()
+    {
+        ['K'] = Color.FromArgb(30, 10, 14),      // kontur
+        ['R'] = Color.FromArgb(214, 40, 57),     // kırmızı
+        ['D'] = Color.FromArgb(142, 21, 38),     // koyu kırmızı
+        ['L'] = Color.FromArgb(255, 107, 94),    // ışık
+        ['B'] = Color.FromArgb(244, 162, 89),    // karın
+        ['b'] = Color.FromArgb(201, 123, 60),    // karın gölgesi
+        ['W'] = Color.FromArgb(125, 29, 44),     // kanat zarı (arka)
+        ['w'] = Color.FromArgb(168, 40, 59),     // kanat zarı (ön)
+        ['H'] = Color.FromArgb(238, 221, 187),   // kemik / boynuz
+        ['h'] = Color.FromArgb(184, 162, 126),   // kemik gölgesi
+        ['T'] = Color.FromArgb(255, 126, 179),   // dil
+        ['t'] = Color.FromArgb(201, 67, 126),    // dil gölgesi
+        ['E'] = Color.FromArgb(250, 236, 236),   // göz akı
+        ['S'] = Color.White,                     // diş
+        ['G'] = Color.FromArgb(80, 0, 0, 0),     // yer gölgesi
+    };
+
+    /// <summary>32x32: kanatlardan kafaya kadar tüm ejderha.</summary>
+    public static readonly string[] Large =
+    {
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        ".......KKK......................",
+        "......KKHHK.....KK..............",
+        ".....KKKwHK....KDWK.............",
+        "....KHwwwHK...KWDDDKK...........",
+        "...KHwwwwHK...KDDWWDDK..........",
+        "..KHHwwwwHK...KDWWWWWDK.........",
+        ".KwhwwwwwHK...KDWWWKKK..........",
+        ".KHhwwwwwHK..KWKWWWK............",
+        ".KHhwwwwwHK..KKHKKK.............",
+        ".KHhwwwKwHHK.KDKHhK.............",
+        ".KHhwwwKwwHK.KDKHHhK............",
+        "KwHKhwwwwwHKKWDWKHhKKKKKK.......",
+        "KHwwhwwwwwHKKWDWKRHhLLLLLK......",
+        "KHwwhwwwwwHKKWDKLRRRRRRRRLK.....",
+        "KHwwhKwwKwHKKDKLRRRRKEEEKRLKK...",
+        "KHwwKDKKDKKDKKKRRRRREKEKERRLLK..",
+        "KHKKDDKDDKLRLLLRRRRREEKEERRRKLK.",
+        ".KKKRRLRRLRRRRRRRRRREKEKERRRRRK.",
+        ".KLLRRRRRRRRRRRRRRRRKEEEKRRRRRK.",
+        "KLRRRRRRRRRRRRRRRRRRRRRRRRRRRRLK",
+        "KRRRRRRRRRRRRRRRRRRRRRRRRRKKKKK.",
+        "KRRRRRRRRRRRRRRRDRRRRKKKKKSTTKK.",
+        "KRRRRRBBBBBBBRRRKRRRRRRSRRRRTTK.",
+        "KDRBBBBBBBBBBBRRLRRRDDDDDDDDDTTK",
+        ".KDbBBBBBBBBBDRRRDDDKKKKKKKKKTtK",
+        "..KKbbbbbbbbbKDDDKKKGGGGGGGKtTtK",
+        ".GGGKKKKKKKKKGKKKGGGGGGGGGGGKKK.",
+        "........GGGGGGGGGGGGGGGG........",
+    };
+
+    /// <summary>16x16: küçük boyutlar için yalnızca kafa (çarpı göz ve dil okunabilsin diye).</summary>
+    public static readonly string[] Small =
+    {
+        "................",
+        "...K............",
+        "..KWK...........",
+        ".KWLK...........",
+        "KWLLHKKKK.......",
+        "KWLLHHLLLK......",
+        "KWLLRHRRRLKK....",
+        "KLLRRRKEKRLLK...",
+        "KLRRRREKERRRLK..",
+        ".KRRRRKEKRRRKLK.",
+        ".KDRRRRRRRRRRRK.",
+        "..KRRRRRRRRRRRK.",
+        "..KDRRRRKKKKKKK.",
+        "...KDDDDDDDDTTK.",
+        "...GKKKKKKKKKTtK",
+        ".GGGGGGGGGGGGKK.",
+    };
+
+    private static readonly Lazy<Bitmap> Cached = new(() => Render(32));
+
+    /// <summary>Piksel verisini verilen boyutta (en yakın komşu, keskin) bir bitmap'e çizer.</summary>
+    public static Bitmap Render(int size)
+    {
+        var grid = size < 32 ? Small : Large;
+        var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        int n = grid.Length;
+        for (int y = 0; y < size; y++)
+            for (int x = 0; x < size; x++)
+            {
+                char c = grid[y * n / size][x * n / size];
+                bmp.SetPixel(x, y, Palette.TryGetValue(c, out var col) ? col : Color.Transparent);
+            }
+        return bmp;
+    }
+
+    /// <summary>Logoyu bir alana keskin (bulanıklaşmadan) çizer.</summary>
+    public static void Draw(Graphics g, RectangleF dest)
+    {
+        var bmp = Cached.Value;
+        var oldMode = g.InterpolationMode;
+        var oldOffset = g.PixelOffsetMode;
+        g.InterpolationMode = InterpolationMode.NearestNeighbor;
+        g.PixelOffsetMode = PixelOffsetMode.Half;
+        g.DrawImage(bmp, dest);
+        g.InterpolationMode = oldMode;
+        g.PixelOffsetMode = oldOffset;
+    }
+
+    /// <summary>Programa gömülü çok boyutlu simge (DragonSaj.ico).</summary>
+    public static Icon LoadIcon()
+    {
+        using var stream = typeof(DragonLogo).Assembly.GetManifestResourceStream("DragonSaj.ico");
+        return stream != null ? new Icon(stream) : Icon.FromHandle(Render(32).GetHicon());
+    }
+}

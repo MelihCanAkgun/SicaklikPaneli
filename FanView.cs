@@ -2,7 +2,7 @@ using System.Drawing.Drawing2D;
 
 namespace SicaklikPaneli;
 
-/// <summary>"FANLAR" sayfası: fan durumu, mod seçimi, sürüklenebilir fan eğrisi ve sıcaklık koruması.</summary>
+/// <summary>"Fanlar" sayfası: fan durumu, mod seçimi, sürüklenebilir fan eğrisi ve sıcaklık koruması.</summary>
 public sealed class FanView : PanelView
 {
     private const float AxisTempMin = 30, AxisTempMax = 100, AxisSpeedMax = 150;
@@ -63,8 +63,8 @@ public sealed class FanView : PanelView
             return;
         }
 
-        DrawFanCard(g, new RectangleF(20, 68, 200, 96), "İŞLEMCİ FANI", Theme.Cpu, fan.CpuRpm, fan.CpuPercent, Data.CpuTemp);
-        DrawFanCard(g, new RectangleF(232, 68, 200, 96), "EKRAN KARTI FANI", Theme.Gpu, fan.GpuRpm, fan.GpuPercent, Data.GpuTemp);
+        DrawFanCard(g, new RectangleF(20, 68, 200, 96), "İşlemci fanı", Theme.Cpu, fan.CpuRpm, fan.CpuPercent, Data.CpuTemp);
+        DrawFanCard(g, new RectangleF(232, 68, 200, 96), "Ekran kartı fanı", Theme.Gpu, fan.GpuRpm, fan.GpuPercent, Data.GpuTemp);
         DrawModeCard(g, new RectangleF(444, 68, 396, 96), fan);
         DrawCurveCard(g, fan);
         DrawSideCard(g, new RectangleF(592, 176, 248, 336), fan);
@@ -90,14 +90,14 @@ public sealed class FanView : PanelView
     {
         DrawCard(g, r);
         DrawLabel(g, label, r.X + 16, r.Y + 12, color);
-        using var big = Theme.Font(30, true);
+        using var big = Theme.Number(32);
         using var small = Theme.Font(12);
         using var text = new SolidBrush(Theme.Text);
         using var muted = new SolidBrush(Theme.Muted);
         string value = rpm > 0 ? rpm.ToString() : "0";
         g.DrawString(value, big, text, r.X + 12, r.Y + 32);
         float w = g.MeasureString(value, big).Width;
-        g.DrawString("RPM", small, muted, r.X + 8 + w, r.Y + 52);
+        g.DrawString("RPM", small, muted, r.X + 8 + w, r.Y + 32 + Theme.Ascent(big) - Theme.Ascent(small));
         string sub = $"%{percent}" + (temp.HasValue ? $"  ·  {temp.Value:0}°C" : "");
         g.DrawString(rpm > 0 ? sub : "Duruyor" + (temp.HasValue ? $"  ·  {temp.Value:0}°C" : ""), small, muted, r.X + 16, r.Y + 72);
     }
@@ -105,7 +105,7 @@ public sealed class FanView : PanelView
     private void DrawModeCard(Graphics g, RectangleF r, FanState fan)
     {
         DrawCard(g, r);
-        DrawLabel(g, "FAN MODU", r.X + 16, r.Y + 12);
+        DrawLabel(g, "Fan modu", r.X + 16, r.Y + 12);
 
         bool full = fan.Boost && !fan.AutoBoostActive;
         bool auto = !full && fan.Mode == FanEcMode.Otomatik;
@@ -122,7 +122,7 @@ public sealed class FanView : PanelView
             using var font = Theme.Font(11, true);
             using var b = new SolidBrush(Color.FromArgb(255, 150, 150));
             using var far = new StringFormat { Alignment = StringAlignment.Far };
-            g.DrawString("SICAKLIK KORUMASI ETKİN", font, b, new RectangleF(r.X, r.Y + 13, r.Width - 16, 16), far);
+            g.DrawString("Sıcaklık koruması etkin", font, b, new RectangleF(r.X, r.Y + 13, r.Width - 16, 16), far);
         }
     }
 
@@ -138,7 +138,7 @@ public sealed class FanView : PanelView
     {
         var r = CurveCard;
         DrawCard(g, r);
-        DrawLabel(g, "FAN EĞRİSİ", r.X + 18, r.Y + 16);
+        DrawLabel(g, "Fan eğrisi", r.X + 18, r.Y + 16);
         Button(g, new RectangleF(r.Right - 18 - 232, r.Y + 10, 112, 28), "İşlemci fanı", !_editGpu,
             () => _editGpu = false, activeColor: Color.FromArgb(52, 96, 150), fontSize: 12);
         Button(g, new RectangleF(r.Right - 18 - 116, r.Y + 10, 116, 28), "Ekran kartı fanı", _editGpu,
@@ -227,7 +227,7 @@ public sealed class FanView : PanelView
     private void DrawSideCard(Graphics g, RectangleF r, FanState fan)
     {
         DrawCard(g, r);
-        DrawLabel(g, "SICAKLIK KORUMASI", r.X + 16, r.Y + 16);
+        DrawLabel(g, "Sıcaklık koruması", r.X + 16, r.Y + 16);
 
         // Aç/kapat anahtarı
         var sw = new RectangleF(r.Right - 16 - 40, r.Y + 13, 40, 22);
@@ -246,7 +246,7 @@ public sealed class FanView : PanelView
         float sy = r.Y + 106;
         Button(g, new RectangleF(r.X + 16, sy, 44, 38), "−", false, () => ChangeProtectionTemp(-1), fontSize: 18);
         Button(g, new RectangleF(r.Right - 16 - 44, sy, 44, 38), "+", false, () => ChangeProtectionTemp(+1), fontSize: 18);
-        using var big = Theme.Font(24, true);
+        using var big = Theme.Number(26);
         var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
         using var valueBrush = new SolidBrush(ProtectionEnabled ? Theme.Text : Theme.Muted);
         g.DrawString($"{ProtectionTemp}°C", big, valueBrush, new RectangleF(r.X + 60, sy, r.Width - 120, 38), fmt);
@@ -255,7 +255,7 @@ public sealed class FanView : PanelView
         g.DrawLine(sep, r.X + 16, r.Y + 166, r.Right - 16, r.Y + 166);
 
         // Hazır ayarlar
-        DrawLabel(g, "HAZIR AYARLAR", r.X + 16, r.Y + 182);
+        DrawLabel(g, "Hazır ayarlar", r.X + 16, r.Y + 182);
         float bw = (r.Width - 32 - 8) / 2, by = r.Y + 208;
         for (int i = 0; i < Presets.Length; i++)
         {

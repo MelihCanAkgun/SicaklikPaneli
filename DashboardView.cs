@@ -2,7 +2,7 @@ using System.Drawing.Drawing2D;
 
 namespace SicaklikPaneli;
 
-/// <summary>"GENEL" sayfası: işlemci, ekran kartı, sıcaklık geçmişi ve bellek.</summary>
+/// <summary>"Genel" sayfası: işlemci, ekran kartı, sıcaklık geçmişi ve bellek.</summary>
 public sealed class DashboardView : PanelView
 {
     private const float TempMin = 30, TempMax = 100;
@@ -23,15 +23,15 @@ public sealed class DashboardView : PanelView
     protected override void DrawContent(Graphics g)
     {
         var fan = Data.Fan;
-        DrawDeviceCard(g, new RectangleF(20, 68, 400, 250), "İŞLEMCİ", Data.CpuName, Theme.Cpu,
+        DrawDeviceCard(g, new RectangleF(20, 68, 400, 250), "İşlemci", Data.CpuName, Theme.Cpu,
             Data.CpuTemp, Data.CpuLoad, Data.CpuPower, Data.CpuThrottle,
-            "FREKANS", Data.CpuClock is float mhz ? $"{mhz / 1000f:0.00} GHz" : "--", null,
+            "Frekans", Data.CpuClock is float mhz ? $"{mhz / 1000f:0.00} GHz" : "--", null,
             fan.Available ? fan.CpuRpm : null);
 
         string vram = Data.GpuMemUsed is float u && Data.GpuMemTotal is float t && t > 0
             ? $"{u / 1024f:0.0} / {t / 1024f:0.0} GB" : "--";
         float? vramPct = Data.GpuMemUsed is float u2 && Data.GpuMemTotal is float t2 && t2 > 0 ? u2 / t2 * 100 : null;
-        DrawDeviceCard(g, new RectangleF(440, 68, 400, 250), "EKRAN KARTI", Data.GpuName, Theme.Gpu,
+        DrawDeviceCard(g, new RectangleF(440, 68, 400, 250), "Ekran kartı", Data.GpuName, Theme.Gpu,
             Data.GpuTemp, Data.GpuLoad, Data.GpuPower, Data.GpuThrottle, "VRAM", vram, vramPct,
             fan.Available ? fan.GpuRpm : null);
 
@@ -61,16 +61,16 @@ public sealed class DashboardView : PanelView
 
         // Sağ sütun
         float x = r.X + 216, w = r.Width - 216 - 22;
-        DrawStat(g, x, r.Y + 62, w, "KULLANIM", load.HasValue ? $"{load.Value:0}%" : "--", load, color, true);
-        DrawStat(g, x, r.Y + 108, w, "GÜÇ", power.HasValue ? $"{power.Value:0.0} W" : "--", null, color, false);
+        DrawStat(g, x, r.Y + 62, w, "Kullanım", load.HasValue ? $"{load.Value:0}%" : "--", load, color, true);
+        DrawStat(g, x, r.Y + 108, w, "Güç", power.HasValue ? $"{power.Value:0.0} W" : "--", null, color, false);
         DrawStat(g, x, r.Y + 142, w, extraLabel, extraValue, extraPercent, color, extraPercent.HasValue);
-        DrawStat(g, x, r.Y + (extraPercent.HasValue ? 188 : 176), w, "FAN",
+        DrawStat(g, x, r.Y + (extraPercent.HasValue ? 188 : 176), w, "Fan",
             fanRpm is int rpm ? (rpm > 0 ? $"{rpm} RPM" : "Duruyor") : "--", null, color, false);
     }
 
     private static void DrawThrottleBadge(Graphics g, float right, float y)
     {
-        const string text = "ISIL KISITLAMA";
+        const string text = "Isıl kısıtlama";
         using var font = Theme.Font(11, true);
         float tw = g.MeasureString(text, font).Width;
         var rect = new RectangleF(right - tw - 34, y, tw + 34, 24);
@@ -94,7 +94,7 @@ public sealed class DashboardView : PanelView
             g.DrawArc(pen, rect, start, sweep * frac);
         }
 
-        using var big = Theme.Font(44, true);
+        using var big = Theme.Number(46);
         using var unit = Theme.Font(14);
         using var tb = new SolidBrush(Theme.Text);
         using var mb = new SolidBrush(Theme.Muted);
@@ -107,11 +107,11 @@ public sealed class DashboardView : PanelView
     private static void DrawStat(Graphics g, float x, float y, float w, string label, string value,
         float? percent, Color color, bool withBar)
     {
-        using var labelFont = Theme.Font(11, true);
-        using var valueFont = Theme.Font(16, true);
+        using var labelFont = Theme.Font(12);
+        using var valueFont = Theme.Number(17);
         using var muted = new SolidBrush(Theme.Muted);
         using var text = new SolidBrush(Theme.Text);
-        g.DrawString(label, labelFont, muted, x, y + 4);
+        g.DrawString(label, labelFont, muted, x, y + Theme.Ascent(valueFont) - Theme.Ascent(labelFont));
         using var right = new StringFormat { Alignment = StringAlignment.Far };
         g.DrawString(value, valueFont, text, new RectangleF(x, y, w, 24), right);
         if (withBar) Theme.Bar(g, new RectangleF(x + 2, y + 28, w - 4, 6), percent, color);
@@ -122,7 +122,7 @@ public sealed class DashboardView : PanelView
     private void DrawHistoryCard(Graphics g, RectangleF r)
     {
         DrawCard(g, r);
-        DrawLabel(g, "SICAKLIK GEÇMİŞİ", r.X + 18, r.Y + 14);
+        DrawLabel(g, "Sıcaklık geçmişi", r.X + 18, r.Y + 14);
         using var small = Theme.Font(11);
         using var muted = new SolidBrush(Theme.Muted);
 
@@ -185,8 +185,8 @@ public sealed class DashboardView : PanelView
     private void DrawRamCard(Graphics g, RectangleF r)
     {
         DrawCard(g, r);
-        DrawLabel(g, "BELLEK", r.X + 18, r.Y + 14);
-        using var big = Theme.Font(34, true);
+        DrawLabel(g, "Bellek", r.X + 18, r.Y + 14);
+        using var big = Theme.Number(36);
         using var mid = Theme.Font(13);
         using var muted = new SolidBrush(Theme.Muted);
         using var text = new SolidBrush(Theme.Text);
@@ -195,7 +195,7 @@ public sealed class DashboardView : PanelView
         string used = Data.RamUsed.HasValue ? Data.RamUsed.Value.ToString("0.0") : "--";
         g.DrawString(used, big, text, r.X + 14, r.Y + 52);
         float uw = g.MeasureString(used, big).Width;
-        g.DrawString("GB", mid, muted, r.X + 10 + uw, r.Y + 74);
+        g.DrawString("GB", mid, muted, r.X + 10 + uw, r.Y + 52 + Theme.Ascent(big) - Theme.Ascent(mid));
 
         Theme.Bar(g, new RectangleF(r.X + 20, r.Y + 118, r.Width - 40, 8), pct, Color.FromArgb(176, 176, 190));
         string total = Data.RamTotal.HasValue ? $"Toplam {Data.RamTotal.Value:0.0} GB" : "";
@@ -211,7 +211,7 @@ public sealed class DashboardView : PanelView
         // Performans modu (MSI Shift)
         var fan = Data.Fan;
         bool canSwitch = fan.Available && fan.Perf != PerfMode.Bilinmiyor;
-        DrawLabel(g, "PERFORMANS", 22, 553);
+        DrawLabel(g, "Performans", 22, 553);
         Button(g, new RectangleF(124, 544, 92, 34), "Turbo", fan.Perf == PerfMode.Turbo,
             () => PerfSelected?.Invoke(PerfMode.Turbo), enabled: canSwitch);
         Button(g, new RectangleF(220, 544, 92, 34), "Dengeli", fan.Perf == PerfMode.Dengeli,
@@ -224,7 +224,7 @@ public sealed class DashboardView : PanelView
         }
 
         // Oyun paneli modu
-        DrawLabel(g, "OYUN PANELİ", 448, 553);
+        DrawLabel(g, "Oyun paneli", 448, 553);
         for (int i = 0; i < Segments.Length; i++)
         {
             var (mode, text) = Segments[i];

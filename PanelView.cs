@@ -10,7 +10,7 @@ namespace SicaklikPaneli;
 public abstract class PanelView : Control
 {
     public const int LogicalWidth = 860, LogicalHeight = 600;
-    public static readonly string[] Tabs = { "GENEL", "FANLAR", "PERFORMANS" };
+    public static readonly string[] Tabs = { "Genel", "Fanlar", "Performans" };
 
     public int ActiveTab;
     public bool RtssConnected, RtssInstalled;
@@ -35,11 +35,11 @@ public abstract class PanelView : Control
     public void Render(Graphics g, float scale)
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = TextRenderingHint.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
         g.Clear(Theme.Background);
         g.ScaleTransform(scale, scale);
         _hits.Clear();
-        DrawHeader(g);
+        DrawHeader(g, scale);
         DrawContent(g);
     }
 
@@ -47,15 +47,20 @@ public abstract class PanelView : Control
 
     // ---------------- Ortak çizimler ----------------
 
-    private void DrawHeader(Graphics g)
+    private void DrawHeader(Graphics g, float scale)
     {
-        Theme.FillRounded(g, Theme.Accent, new RectangleF(20, 22, 4, 26), 2);
+        // Logo: piksel sanatı bulanıklaşmasın diye ekranda tam sayı katında ve piksel ızgarasına oturtulmuş çizilir
+        int k = Math.Max(1, (int)Math.Round(34 * scale / 32));
+        float logo = k * 32 / scale;
+        float lx = MathF.Round(18 * scale) / scale, ly = MathF.Round((35 - logo / 2) * scale) / scale;
+        DragonLogo.Draw(g, new RectangleF(lx, ly, logo, logo));
+
         using var title = Theme.Font(20, true);
         using var tb = new SolidBrush(Theme.Text);
-        g.DrawString("SICAKLIK PANELİ", title, tb, 32, 20);
+        g.DrawString("Dragon Saj", title, tb, lx + logo + 8, 21);
 
         // Sekmeler
-        using var tabFont = Theme.Font(13, true);
+        using var tabFont = Theme.Font(14, true);
         using var muted = new SolidBrush(Theme.Muted);
         float x = 262;
         for (int i = 0; i < Tabs.Length; i++)

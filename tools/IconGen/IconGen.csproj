@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- DragonSaj.ico dosyasını DragonLogo.cs'deki piksel verisinden üretir:
+       dotnet run (proje: tools\IconGen), argüman: DragonSaj.ico -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\DragonLogo.cs" Link="DragonLogo.cs" />
+  </ItemGroup>
+
+</Project>

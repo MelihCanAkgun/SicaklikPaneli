@@ -11,8 +11,16 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <AssemblyName>SicaklikPaneli</AssemblyName>
+    <AssemblyName>DragonSaj</AssemblyName>
+    <Product>Dragon Saj</Product>
+    <AssemblyTitle>Dragon Saj</AssemblyTitle>
+    <ApplicationIcon>DragonSaj.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="tools\**" />
+    <EmbeddedResource Include="DragonSaj.ico" LogicalName="DragonSaj.ico" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />

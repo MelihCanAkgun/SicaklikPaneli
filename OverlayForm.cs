@@ -62,7 +62,7 @@ public sealed class OverlayForm : Form
     public static void Render(Graphics g, float scale, Snapshot data)
     {
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.TextRenderingHint = TextRenderingHint.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
         g.Clear(Color.FromArgb(14, 14, 17));
         g.ScaleTransform(scale, scale);
 
@@ -76,7 +76,7 @@ public sealed class OverlayForm : Form
         Theme.FillRounded(g, color, new RectangleF(9, y + 3, 3, h - 6), 1.5f);
 
         using var labelFont = Theme.Font(12, true);
-        using var valueFont = Theme.Font(15, true);
+        using var valueFont = Theme.Number(16);
         using var loadFont = Theme.Font(13);
         using var labelBrush = new SolidBrush(color);
         using var tempBrush = new SolidBrush(throttle ? Theme.Warning : Theme.TempColor(temp));
