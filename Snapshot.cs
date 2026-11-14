@@ -57,7 +57,8 @@ public sealed record FanCurve(int[] Temps, int[] Speeds)
     }
 }
 
-public enum FanEcMode { Otomatik, Temel, Ozel, Bilinmiyor }
+/// <summary>Fan modu: programın seçtiği mod (henüz bir şey seçilmediyse EC'den okunan).</summary>
+public enum FanSelect { Bilinmiyor, Otomatik, Ozel, Sabit }
 
 /// <summary>MSI "Shift" performans modu (Dragon Center'daki performans seviyesi).</summary>
 public enum PerfMode { Turbo, Sport, Dengeli, Eco, Bilinmiyor }
@@ -72,11 +73,13 @@ public sealed record FanState
     public int GpuPercent { get; init; }
     public int CpuRpm { get; init; }
     public int GpuRpm { get; init; }
-    public FanEcMode Mode { get; init; } = FanEcMode.Bilinmiyor;
+    public FanSelect Selected { get; init; } = FanSelect.Bilinmiyor;
     public PerfMode Perf { get; init; } = PerfMode.Bilinmiyor;
     public bool Boost { get; init; }            // Cooler Boost şu an açık
     public bool AutoBoostActive { get; init; }  // sıcaklık koruması tarafından açıldı
-    public int? FixedRpm { get; init; }         // sabit devir modundaysa hedef RPM
+    public bool ManualBoost { get; init; }      // tam hız kullanıcı tarafından açıldı
+    public int? FixedCpuRpm { get; init; }      // sabit devir modundaysa işlemci fanı hedefi
+    public int? FixedGpuRpm { get; init; }      // sabit devir modundaysa ekran kartı fanı hedefi
     public int CommandSeq { get; init; }        // EC'ye işlenmiş son arayüz komutunun sıra numarası
     public FanCurve? Cpu { get; init; }
     public FanCurve? Gpu { get; init; }

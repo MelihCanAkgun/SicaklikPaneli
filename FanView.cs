@@ -16,22 +16,25 @@ public sealed class FanView : PanelView
     public event Action<FanCurve, FanCurve>? ApplyRequested;
     public event Action? AutoRequested;
     public event Action<bool>? BoostRequested;
-    public event Action<int>? FixedRequested;
+    public event Action<int, int>? FixedRequested; // işlemci, ekran kartı (RPM)
     public event Action<bool, int>? ProtectionChanged;
 
-    /// <summary>Sabit devir hedefi (RPM). Çubuk sürüklenirken yalnızca burada değişir, bırakınca uygulanır.</summary>
-    public int FixedTarget = 3000;
+    /// <summary>Sabit devir hedefleri (RPM). Çubuk sürüklenirken yalnızca burada değişir, bırakınca uygulanır.</summary>
+    public int FixedCpuTarget = 3000, FixedGpuTarget = 3000;
     /// <summary>Gönderilen son komutun sıra numarası; EC bunu işleyene kadar seçim "bekliyor" sayılır.</summary>
     public int PendingSeq;
-    /// <summary>En son uygulanan özel eğri (ayarlardan); sabit devirden "Özel eğri"ye dönerken kullanılır.</summary>
-    public (FanCurve cpu, FanCurve gpu)? SavedCustom;
 
     private enum Choice { Yok, Otomatik, Ozel, Sabit, TamHiz }
     // Tıklanan mod, EC onaylayana kadar hemen seçili gösterilir
     private Choice _pending = Choice.Yok;
     private DateTime _pendingAt;
-    private bool _forceCurve, _sliderDrag, _sliderHover;
-    private static readonly RectangleF SliderTrack = new(CurveCard.X + 44, CurveCard.Y + 160, CurveCard.Width - 88, 6);
+    private bool _forceCurve;
+    private int _sliderDrag = -1, _sliderHover = -1; // 0: işlemci, 1: ekran kartı
+
+    // Sabit devir kartındaki iki blok (işlemci, ekran kartı)
+    private const float FixedBlockTop = 48, FixedBlockHeight = 124;
+    private static float BlockY(int fan) => CurveCard.Y + FixedBlockTop + fan * FixedBlockHeight;
+    private static RectangleF SliderTrack(int fan) => new(CurveCard.X + 34, BlockY(fan) + 78, CurveCard.Width - 68, 6);
 
     // Düzenlenen (henüz uygulanmamış olabilir) eğriler
     private FanCurve? _cpu, _gpu;
@@ -60,8 +63,11 @@ public sealed class FanView : PanelView
         var fan = s.Fan;
         if (_pending != Choice.Yok && (fan.CommandSeq >= PendingSeq || DateTime.UtcNow - _pendingAt > TimeSpan.FromSeconds(6)))
             _pending = Choice.Yok;
-        if (_pending == Choice.Yok && !_sliderDrag && fan.FixedRpm is int target)
-            FixedTarget = target;
+        if (_pending == Choice.Yok && _sliderDrag < 0)
+        {
+            if (fan.FixedCpuRpm is int c) FixedCpuTarget = c;
+            if (fan.FixedGpuRpm is int g) FixedGpuTarget = g;
+        }
         if (fan.Available && fan.Cpu != null && fan.Gpu != null &&
             (_cpu == null || (fan.Revision != _loadedRevision && !_dirty)))
         {
@@ -74,14 +80,18 @@ public sealed class FanView : PanelView
     private FanCurve? Editing => _editGpu ? _gpu : _cpu;
 
     /// <summary>Tam hız dışındaki temel mod (tam hız kapatılınca dönülecek olan).</summary>
-    private static Choice Underlying(FanState fan) =>
-        fan.Mode == FanEcMode.Ozel ? (fan.FixedRpm != null ? Choice.Sabit : Choice.Ozel)
-      : fan.Mode == FanEcMode.Otomatik ? Choice.Otomatik : Choice.Yok;
+    private static Choice Underlying(FanState fan) => fan.Selected switch
+    {
+        FanSelect.Otomatik => Choice.Otomatik,
+        FanSelect.Ozel => Choice.Ozel,
+        FanSelect.Sabit => Choice.Sabit,
+        _ => Choice.Yok
+    };
 
-    /// <summary>Ekranda seçili görünen mod: bekleyen tıklama varsa o, yoksa EC'nin bildirdiği.</summary>
+    /// <summary>Ekranda seçili görünen mod: bekleyen tıklama varsa o, yoksa programın seçtiği mod.</summary>
     private Choice Current(FanState fan) =>
         _pending != Choice.Yok ? _pending
-      : fan.Boost && !fan.AutoBoostActive ? Choice.TamHiz
+      : fan.ManualBoost ? Choice.TamHiz
       : Underlying(fan);
 
     private bool FixedView => !_forceCurve && Current(Data.Fan) == Choice.Sabit;
@@ -97,7 +107,7 @@ public sealed class FanView : PanelView
     private void RequestFixed()
     {
         SetPending(Choice.Sabit);
-        FixedRequested?.Invoke(FixedTarget);
+        FixedRequested?.Invoke(FixedCpuTarget, FixedGpuTarget);
     }
 
     protected override void DrawContent(Graphics g)
@@ -166,13 +176,7 @@ public sealed class FanView : PanelView
         });
         Button(g, Slot(1), "Özel eğri", current == Choice.Ozel, () =>
         {
-            // Sabit devirden dönerken EC'deki düz eğri değil, kayıtlı özel eğri (yoksa fabrika eğrisi) uygulanır
-            if (current == Choice.Sabit && !_dirty)
-            {
-                var (cpu, gpu) = SavedCustom ?? (fan.FactoryCpu!, fan.FactoryGpu!);
-                _cpu = cpu.Copy();
-                _gpu = gpu.Copy();
-            }
+            // Düzenleyicide her zaman son kaydedilen özel eğri durur (sabit devirde EC'deki düz eğri değil)
             _forceCurve = true;
             Apply();
         });
@@ -291,17 +295,30 @@ public sealed class FanView : PanelView
 
     // ---------------- Sabit devir ----------------
 
-    private static float SliderX(int rpm) =>
-        SliderTrack.X + (rpm - FanController.FixedMinRpm) / (float)(FanController.FixedMaxRpm - FanController.FixedMinRpm) * SliderTrack.Width;
-
-    private static int SliderValue(float x)
+    private static float SliderX(int fan, int rpm)
     {
-        float t = Math.Clamp((x - SliderTrack.X) / SliderTrack.Width, 0, 1);
-        int rpm = FanController.FixedMinRpm + (int)Math.Round(t * (FanController.FixedMaxRpm - FanController.FixedMinRpm) / 100f) * 100;
+        var t = SliderTrack(fan);
+        return t.X + (rpm - FanController.FixedMinRpm) / (float)(FanController.FixedMaxRpm - FanController.FixedMinRpm) * t.Width;
+    }
+
+    private static int SliderValue(int fan, float x)
+    {
+        var t = SliderTrack(fan);
+        float k = Math.Clamp((x - t.X) / t.Width, 0, 1);
+        int rpm = FanController.FixedMinRpm + (int)Math.Round(k * (FanController.FixedMaxRpm - FanController.FixedMinRpm) / 100f) * 100;
         return Math.Clamp(rpm, FanController.FixedMinRpm, FanController.FixedMaxRpm);
     }
 
-    private static RectangleF SliderHitArea => RectangleF.Inflate(SliderTrack, 14, 16);
+    /// <summary>Verilen noktadaki çubuk (0: işlemci, 1: ekran kartı, -1: yok).</summary>
+    private int SliderAt(PointF p)
+    {
+        if (!Data.Fan.Available || !FixedView) return -1;
+        for (int i = 0; i < 2; i++)
+            if (RectangleF.Inflate(SliderTrack(i), 14, 14).Contains(p)) return i;
+        return -1;
+    }
+
+    private ref int Target(int fan) => ref fan == 0 ? ref FixedCpuTarget : ref FixedGpuTarget;
 
     private void DrawFixedCard(Graphics g, FanState fan)
     {
@@ -312,78 +329,79 @@ public sealed class FanView : PanelView
         using var small = Theme.Font(11);
         using var font = Theme.Font(12);
         using var muted = new SolidBrush(Theme.Muted);
-        using var text = new SolidBrush(Theme.Text);
         using var far = new StringFormat { Alignment = StringAlignment.Far };
-        g.DrawString("Fanlar seçilen devirde tutulur", font, muted, new RectangleF(r.X, r.Y + 16, r.Width - 18, 18), far);
+        g.DrawString("Her fan kendi hedef devrinde tutulur", font, muted, new RectangleF(r.X, r.Y + 16, r.Width - 18, 18), far);
 
-        // Hedef değer ve ince ayar düğmeleri
-        float cx = r.X + r.Width / 2, vy = r.Y + 56;
-        Button(g, new RectangleF(cx - 168, vy + 6, 44, 40), "−", false, () => StepFixed(-100), fontSize: 18);
-        Button(g, new RectangleF(cx + 124, vy + 6, 44, 40), "+", false, () => StepFixed(+100), fontSize: 18);
-        using var big = Theme.Number(46);
-        using var unit = Theme.Font(14);
-        string value = FixedTarget.ToString();
-        float vw = g.MeasureString(value, big).Width, uw = g.MeasureString("RPM", unit).Width;
-        float vx = cx - (vw + uw) / 2;
-        g.DrawString(value, big, text, vx, vy);
-        g.DrawString("RPM", unit, muted, vx + vw - 6, vy + Theme.Ascent(big) - Theme.Ascent(unit));
-
-        // Çubuk
-        float kx = SliderX(FixedTarget);
-        Theme.FillRounded(g, Theme.Track, SliderTrack, 3);
-        Theme.FillRounded(g, Theme.Accent, new RectangleF(SliderTrack.X, SliderTrack.Y, kx - SliderTrack.X, SliderTrack.Height), 3);
-        using var center = new StringFormat { Alignment = StringAlignment.Center };
-        using var tick = new Pen(Theme.CardBorder, 1);
-        for (int v = FanController.FixedMinRpm; v <= FanController.FixedMaxRpm; v += 500)
-        {
-            float tx = SliderX(v);
-            g.DrawLine(tick, tx, SliderTrack.Bottom + 8, tx, SliderTrack.Bottom + 12);
-            g.DrawString(v.ToString(), small, muted, new RectangleF(tx - 24, SliderTrack.Bottom + 14, 48, 16), center);
-        }
-        float kr = _sliderDrag || _sliderHover ? 11 : 9;
-        float ky = SliderTrack.Y + SliderTrack.Height / 2;
-        g.FillEllipse(Brushes.White, kx - kr, ky - kr, kr * 2, kr * 2);
-        using (var ring = new Pen(Theme.Accent, 2)) g.DrawEllipse(ring, kx - kr, ky - kr, kr * 2, kr * 2);
-
-        // Fanların anlık durumu
-        using var sep = new Pen(Theme.CardBorder);
-        g.DrawLine(sep, r.X + 18, r.Y + 214, r.Right - 18, r.Y + 214);
-        DrawFixedRow(g, r.Y + 228, "İşlemci fanı", Theme.Cpu, fan.CpuRpm, fan.CpuPercent, Data.CpuTemp, fan);
-        DrawFixedRow(g, r.Y + 262, "Ekran kartı fanı", Theme.Gpu, fan.GpuRpm, fan.GpuPercent, Data.GpuTemp, fan);
+        DrawFixedBlock(g, 0, "İşlemci fanı", Theme.Cpu, fan.CpuRpm, fan.CpuPercent, Data.CpuTemp, fan);
+        using (var sep = new Pen(Theme.CardBorder))
+            g.DrawLine(sep, r.X + 18, BlockY(1) - 10, r.Right - 18, BlockY(1) - 10);
+        DrawFixedBlock(g, 1, "Ekran kartı fanı", Theme.Gpu, fan.GpuRpm, fan.GpuPercent, Data.GpuTemp, fan);
 
         g.DrawString($"Güvenlik: {FanController.FixedSafetyTemp}°C üstünde fanlar her durumda tam hıza çıkar.",
-            small, muted, new RectangleF(r.X + 18, r.Bottom - 30, r.Width - 36, 18));
+            small, muted, new RectangleF(r.X + 18, r.Bottom - 28, r.Width - 36, 18));
     }
 
-    private void DrawFixedRow(Graphics g, float y, string label, Color color, int rpm, int percent, float? temp, FanState fan)
+    private void DrawFixedBlock(Graphics g, int index, string label, Color color, int rpm, int percent, float? temp, FanState fan)
     {
         var r = CurveCard;
-        DrawLabel(g, label, r.X + 24, y + 4, color);
-        using var num = Theme.Number(20);
+        float y = BlockY(index);
+        int target = Target(index);
+        int? applied = index == 0 ? fan.FixedCpuRpm : fan.FixedGpuRpm;
+
         using var font = Theme.Font(12);
+        using var small = Theme.Font(11);
         using var muted = new SolidBrush(Theme.Muted);
         using var text = new SolidBrush(Theme.Text);
-        string value = $"{rpm}";
-        g.DrawString(value, num, text, r.X + 170, y);
-        float w = g.MeasureString(value, num).Width;
-        g.DrawString("RPM", font, muted, r.X + 166 + w, y + Theme.Ascent(num) - Theme.Ascent(font));
+        using var far = new StringFormat { Alignment = StringAlignment.Far };
 
-        int target = FixedTarget;
-        (string status, Color c) = fan.FixedRpm == null || _pending == Choice.Sabit ? ("Uygulanıyor…", Theme.Muted)
+        // Başlık ve anlık durum
+        DrawLabel(g, label, r.X + 18, y, color);
+        (string status, Color c) = applied == null || _pending == Choice.Sabit || applied != target ? ("Uygulanıyor…", Theme.Muted)
             : fan.Boost ? ("Tam hız açık", Color.FromArgb(255, 150, 150))
             : temp >= FanController.FixedSafetyTemp ? ("Sıcak: güvenlik için tam hız", Color.FromArgb(255, 150, 150))
             : Math.Abs(rpm - target) <= target * 0.06 ? ("Hedefte", Theme.Ok)
-            : percent >= FanCurve.MaxSpeed && rpm < target ? ("Fan bu devre ulaşamıyor", Color.FromArgb(240, 220, 90))
-            : percent <= FanController.FixedMinSpeed && rpm > target ? ("Fan daha yavaş dönemiyor", Color.FromArgb(240, 220, 90))
+            : percent >= FanCurve.MaxSpeed && rpm < target ? ("Bu devre ulaşamıyor", Color.FromArgb(240, 220, 90))
+            : percent <= FanController.FixedMinSpeed && rpm > target ? ("Daha yavaş dönemiyor", Color.FromArgb(240, 220, 90))
             : ("Ayarlanıyor…", Theme.Muted);
         using var sb = new SolidBrush(c);
-        using var far = new StringFormat { Alignment = StringAlignment.Far };
-        g.DrawString(status, font, sb, new RectangleF(r.X + 280, y + 6, r.Width - 280 - 24, 18), far);
+        float sw = g.MeasureString(status, font).Width;
+        g.DrawString(status, font, sb, new RectangleF(r.X, y, r.Width - 18, 18), far);
+        g.DrawString($"şu an {rpm} RPM  ·", font, muted, new RectangleF(r.X, y, r.Width - 18 - sw, 18), far);
+
+        // Hedef değer ve ince ayar düğmeleri
+        using var big = Theme.Number(30);
+        string value = target.ToString();
+        g.DrawString(value, big, text, r.X + 14, y + 22);
+        float vw = g.MeasureString(value, big).Width;
+        g.DrawString("RPM hedef", font, muted, r.X + 10 + vw, y + 22 + Theme.Ascent(big) - Theme.Ascent(font));
+        Button(g, new RectangleF(r.Right - 18 - 36 - 8 - 36, y + 24, 36, 34), "−", false, () => StepFixed(index, -100), fontSize: 18);
+        Button(g, new RectangleF(r.Right - 18 - 36, y + 24, 36, 34), "+", false, () => StepFixed(index, +100), fontSize: 18);
+
+        // Çubuk
+        var track = SliderTrack(index);
+        float kx = SliderX(index, target);
+        Theme.FillRounded(g, Theme.Track, track, 3);
+        Theme.FillRounded(g, color, new RectangleF(track.X, track.Y, kx - track.X, track.Height), 3);
+        using var center = new StringFormat { Alignment = StringAlignment.Center };
+        using var tick = new Pen(Theme.CardBorder, 1);
+        for (int v = 2000; v <= FanController.FixedMaxRpm; v += 500)
+        {
+            float tx = SliderX(index, v);
+            g.DrawLine(tick, tx, track.Bottom + 6, tx, track.Bottom + 10);
+            if (v % 1000 == 0)
+                g.DrawString(v.ToString(), small, muted, new RectangleF(tx - 24, track.Bottom + 11, 48, 16), center);
+        }
+        float kr = _sliderDrag == index || _sliderHover == index ? 11 : 9;
+        float ky = track.Y + track.Height / 2;
+        g.FillEllipse(Brushes.White, kx - kr, ky - kr, kr * 2, kr * 2);
+        using var ring = new Pen(color, 2);
+        g.DrawEllipse(ring, kx - kr, ky - kr, kr * 2, kr * 2);
     }
 
-    private void StepFixed(int delta)
+    private void StepFixed(int fan, int delta)
     {
-        FixedTarget = Math.Clamp(FixedTarget + delta, FanController.FixedMinRpm, FanController.FixedMaxRpm);
+        ref int target = ref Target(fan);
+        target = Math.Clamp(target + delta, FanController.FixedMinRpm, FanController.FixedMaxRpm);
         RequestFixed();
     }
 
@@ -503,7 +521,7 @@ public sealed class FanView : PanelView
 
     // ---------------- Sürükleme ----------------
 
-    protected override bool HandlesCursor => _drag >= 0 || _hoverHandle >= 0 || _sliderDrag || _sliderHover;
+    protected override bool HandlesCursor => _drag >= 0 || _hoverHandle >= 0 || _sliderDrag >= 0 || _sliderHover >= 0;
 
     private int HandleAt(PointF p)
     {
@@ -525,10 +543,11 @@ public sealed class FanView : PanelView
         base.OnMouseDown(e);
         if (e.Button != MouseButtons.Left) return;
         var lp = ToLogical(e.Location);
-        if (Data.Fan.Available && FixedView && SliderHitArea.Contains(lp))
+        int slider = SliderAt(lp);
+        if (slider >= 0)
         {
-            _sliderDrag = true;
-            FixedTarget = SliderValue(lp.X);
+            _sliderDrag = slider;
+            Target(slider) = SliderValue(slider, lp.X);
             Capture = true;
             Invalidate();
             return;
@@ -548,15 +567,15 @@ public sealed class FanView : PanelView
         var p = ToLogical(e.Location);
         int hover = _drag >= 0 ? _drag : HandleAt(p);
         if (hover != _hoverHandle) { _hoverHandle = hover; Invalidate(); }
-        bool sliderHover = _sliderDrag || (Data.Fan.Available && FixedView && SliderHitArea.Contains(p));
+        int sliderHover = _sliderDrag >= 0 ? _sliderDrag : SliderAt(p);
         if (sliderHover != _sliderHover) { _sliderHover = sliderHover; Invalidate(); }
         base.OnMouseMove(e);
-        if (HandlesCursor) Cursor = _sliderHover ? Cursors.Hand : Cursors.SizeAll;
+        if (HandlesCursor) Cursor = _sliderHover >= 0 ? Cursors.Hand : Cursors.SizeAll;
 
-        if (_sliderDrag)
+        if (_sliderDrag >= 0)
         {
-            int v = SliderValue(p.X);
-            if (v != FixedTarget) { FixedTarget = v; Invalidate(); }
+            int v = SliderValue(_sliderDrag, p.X);
+            if (v != Target(_sliderDrag)) { Target(_sliderDrag) = v; Invalidate(); }
             return;
         }
 
@@ -576,9 +595,9 @@ public sealed class FanView : PanelView
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
-        if (_sliderDrag)
+        if (_sliderDrag >= 0)
         {
-            _sliderDrag = false;
+            _sliderDrag = -1;
             Capture = false;
             RequestFixed(); // bırakınca uygulanır
             Invalidate();

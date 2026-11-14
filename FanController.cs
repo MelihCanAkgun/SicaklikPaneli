@@ -42,9 +42,17 @@ public sealed class FanController : IDisposable
     public const int FixedMinRpm = 1500, FixedMaxRpm = 6200, FixedSafetyTemp = 88, FixedMinSpeed = 20;
     /// <summary>Sabit devir eğrisinin eşikleri; son eşiğin üstünde fanlar her durumda tam hıza çıkar.</summary>
     private static readonly int[] FixedTemps = { 60, 65, 70, 75, 80, FixedSafetyTemp };
-    private int? _fixedRpm;
-    private int _fixedCpuSpeed, _fixedGpuSpeed;
-    private DateTime _lastAdjust = DateTime.MinValue;
+    private int _fixedCpuRpm, _fixedGpuRpm, _fixedCpuSpeed, _fixedGpuSpeed;
+
+    /// <summary>
+    /// Programın istediği mod. Ekranda bu gösterilir; EC'nin anlık okuması değil (MSI Center ve Windows'un
+    /// EC sürücüsü de EC'yi yokladığı için tek tek okumalar yanıltıcı olabilir).
+    /// </summary>
+    private FanSelect _intent = FanSelect.Bilinmiyor;
+    /// <summary>Son uygulanan özel eğri; sabit devir ya da otomatik moddayken de ekranda bu gösterilir.</summary>
+    private FanCurve? _customCpu, _customGpu;
+    private int _mismatch;
+    private DateTime _lastCheck = DateTime.MinValue;
 
     public FanState State => _state;
 
@@ -74,6 +82,8 @@ public sealed class FanController : IDisposable
             }
 
             var (factoryCpu, factoryGpu) = LoadOrCreateBackup(cpu, gpu);
+            _customCpu = cpu.Copy();
+            _customGpu = gpu.Copy();
             _state = new FanState
             {
                 Available = true, Firmware = fw, Cpu = cpu, Gpu = gpu,
@@ -191,6 +201,15 @@ public sealed class FanController : IDisposable
 
     // ---------------- Komutlar ----------------
 
+    /// <summary>Kayıtlı özel eğriyi hatırlar (EC'ye yazmaz); eğri düzenleyici bunu gösterir.</summary>
+    public void RememberCustom(FanCurve cpu, FanCurve gpu)
+    {
+        if (_ec == null) return;
+        _customCpu = cpu.Copy();
+        _customGpu = gpu.Copy();
+        _state = _state with { Cpu = _customCpu, Gpu = _customGpu, Revision = ++_revision };
+    }
+
     /// <summary>Özel eğriyi EC'ye yazar ve "gelişmiş" fan moduna geçer.</summary>
     public bool ApplyCustom(FanCurve cpu, FanCurve gpu)
     {
@@ -206,12 +225,19 @@ public sealed class FanController : IDisposable
         }
         try
         {
-            _fixedRpm = null;
-            bool ok = WriteCurve(AddrCpuTemps, AddrCpuSpeeds, cpu) & WriteCurve(AddrGpuTemps, AddrGpuSpeeds, gpu);
-            ok &= SetMode(ModeAdvanced);
+            _intent = FanSelect.Ozel;
+            _customCpu = cpu.Copy();
+            _customGpu = gpu.Copy();
             _manualBoost = false;
-            ok &= SetBoostBit(_autoBoost);
-            ReloadCurves(ok ? "Eğri uygulandı." : "Bazı değerler yazılamadı; EC'deki güncel eğri gösteriliyor.");
+            bool ok = WriteIntent() & SetBoostBit(_autoBoost);
+            // Ekranda EC'den geri okunan eğri gösterilsin (yazılamayan değer varsa görünsün)
+            _state = _state with
+            {
+                Cpu = ReadCurve(AddrCpuTemps, AddrCpuSpeeds),
+                Gpu = ReadCurve(AddrGpuTemps, AddrGpuSpeeds),
+                Revision = ++_revision
+            };
+            RefreshStatus(ok ? "Eğri uygulandı." : "Bazı değerler yazılamadı; EC'deki güncel eğri gösteriliyor.");
             return ok;
         }
         catch (Exception ex) { _state = _state with { Message = "Yazma hatası: " + ex.Message }; return false; }
@@ -223,9 +249,9 @@ public sealed class FanController : IDisposable
         if (_ec == null) return false;
         try
         {
+            _intent = FanSelect.Otomatik;
             _manualBoost = false;
-            _fixedRpm = null;
-            bool ok = SetMode(ModeAuto) & SetBoostBit(_autoBoost);
+            bool ok = WriteIntent() & SetBoostBit(_autoBoost);
             RefreshStatus(ok ? "Otomatik moda geçildi." : "Mod değiştirilemedi.");
             return ok;
         }
@@ -233,75 +259,32 @@ public sealed class FanController : IDisposable
     }
 
     /// <summary>
-    /// Fanları verilen devirde tutar. Önce tahmini bir hızla düz bir eğri yazılır, sonra
-    /// <see cref="Tick"/> ölçülen devre bakarak hızı hedefe doğru düzeltir.
+    /// İşlemci ve ekran kartı fanını ayrı ayrı verilen devirde tutar. Önce tahmini bir hızla düz bir eğri
+    /// yazılır, sonra <see cref="Tick"/> ölçülen devre bakarak hızı hedefe doğru düzeltir.
     /// </summary>
-    public bool SetFixedRpm(int rpm)
+    public bool SetFixedRpm(int cpuRpm, int gpuRpm)
     {
         if (_ec == null) return false;
         try
         {
-            rpm = Math.Clamp(rpm, FixedMinRpm, FixedMaxRpm);
-            _fixedCpuSpeed = GuessSpeed(rpm, _state.CpuRpm, _state.CpuPercent, _fixedRpm != null ? _fixedCpuSpeed : null);
-            _fixedGpuSpeed = GuessSpeed(rpm, _state.GpuRpm, _state.GpuPercent, _fixedRpm != null ? _fixedGpuSpeed : null);
-            _fixedRpm = rpm;
+            bool wasFixed = _intent == FanSelect.Sabit;
+            cpuRpm = Math.Clamp(cpuRpm, FixedMinRpm, FixedMaxRpm);
+            gpuRpm = Math.Clamp(gpuRpm, FixedMinRpm, FixedMaxRpm);
+            // Hedefi değişmeyen fanın hızına dokunma (zaten ayarlanmış olabilir)
+            if (!wasFixed || cpuRpm != _fixedCpuRpm)
+                _fixedCpuSpeed = GuessSpeed(cpuRpm, _state.CpuRpm, _state.CpuPercent, wasFixed ? _fixedCpuSpeed : null);
+            if (!wasFixed || gpuRpm != _fixedGpuRpm)
+                _fixedGpuSpeed = GuessSpeed(gpuRpm, _state.GpuRpm, _state.GpuPercent, wasFixed ? _fixedGpuSpeed : null);
+            _fixedCpuRpm = cpuRpm;
+            _fixedGpuRpm = gpuRpm;
+            _intent = FanSelect.Sabit;
             _manualBoost = false;
-            bool ok = WriteCurve(AddrCpuTemps, AddrCpuSpeeds, FixedCurve(_fixedCpuSpeed)) &
-                      WriteCurve(AddrGpuTemps, AddrGpuSpeeds, FixedCurve(_fixedGpuSpeed));
-            ok &= SetMode(ModeAdvanced);
-            ok &= SetBoostBit(_autoBoost);
-            _lastAdjust = DateTime.UtcNow;
-            ReloadCurves(ok ? $"Sabit devir: {rpm} RPM hedefleniyor…" : "Sabit devir ayarlanamadı.");
+            bool ok = WriteIntent() & SetBoostBit(_autoBoost);
+            _lastCheck = DateTime.UtcNow;
+            RefreshStatus(ok ? $"Sabit devir: işlemci {cpuRpm}, ekran kartı {gpuRpm} RPM hedefleniyor…" : "Sabit devir ayarlanamadı.");
             return ok;
         }
         catch (Exception ex) { _state = _state with { Message = "Yazma hatası: " + ex.Message }; return false; }
-    }
-
-    private static FanCurve FixedCurve(int speed) =>
-        new((int[])FixedTemps.Clone(), new[] { speed, speed, speed, speed, speed, speed, FanCurve.MaxSpeed });
-
-    /// <summary>Hedef devir için başlangıç hızı: fan dönüyorsa ölçülen hız/devir oranından, dönmüyorsa kaba tahminle.</summary>
-    private static int GuessSpeed(int target, int rpm, int percent, int? current)
-    {
-        int speed = rpm > 300 && percent > 0 ? (int)Math.Round(percent * (double)target / rpm)
-                  : current ?? (int)Math.Round(target / 41.3); // tam hız (150) ≈ 6200 RPM
-        return Math.Clamp(speed, FixedMinSpeed, FanCurve.MaxSpeed);
-    }
-
-    /// <summary>Sabit devir modunda ölçülen devre göre hız değerlerini hedefe yaklaştırır.</summary>
-    private void AdjustFixed(float? cpuTemp, float? gpuTemp)
-    {
-        if (_fixedRpm is not int target || DateTime.UtcNow - _lastAdjust < TimeSpan.FromSeconds(3)) return;
-        _lastAdjust = DateTime.UtcNow;
-        // Tam hız açıksa ya da başka bir yazılım modu değiştirdiyse karışma
-        if ((Read(AddrBoost) & BoostBit) != 0 || (Read(AddrFanMode) & ModeMask) != ModeAdvanced) return;
-
-        Correct(ref _fixedCpuSpeed, ReadRpm(AddrCpuRpm), cpuTemp, AddrCpuSpeeds, target);
-        Correct(ref _fixedGpuSpeed, ReadRpm(AddrGpuRpm), gpuTemp, AddrGpuSpeeds, target);
-    }
-
-    private void Correct(ref int speed, int rpm, float? temp, byte speedAddr, int target)
-    {
-        if (temp >= FixedTemps[^1]) return; // güvenlik kademesindeyken fan zaten tam hızda
-        int next;
-        if (rpm < 300) next = speed + 10; // fan durmuş ya da yeni kalkıyor
-        else
-        {
-            double ratio = (double)target / rpm;
-            if (Math.Abs(ratio - 1) < 0.04) return; // yeterince yakın
-            next = (int)Math.Round(speed * (1 + 0.6 * (ratio - 1))); // ani salınım olmasın diye kısmi düzeltme
-            if (next == speed) next += ratio > 1 ? 1 : -1;
-        }
-        next = Math.Clamp(next, FixedMinSpeed, FanCurve.MaxSpeed);
-        if (next == speed) return;
-        speed = next;
-        for (int i = 0; i < 6; i++) Write((byte)(speedAddr + i), (byte)next);
-        _state = _state with
-        {
-            Cpu = ReadCurve(AddrCpuTemps, AddrCpuSpeeds),
-            Gpu = ReadCurve(AddrGpuTemps, AddrGpuSpeeds),
-            Revision = ++_revision
-        };
     }
 
     /// <summary>Tam hız (Cooler Boost) aç/kapat.</summary>
@@ -346,6 +329,75 @@ public sealed class FanController : IDisposable
         _ => PerfMode.Bilinmiyor
     };
 
+    // ---------------- İstenen durumu EC'ye yazma / denetleme ----------------
+
+    /// <summary>İstenen moda göre EC'de olması gereken eğriler (otomatik modda null).</summary>
+    private (FanCurve cpu, FanCurve gpu)? ExpectedCurves() => _intent switch
+    {
+        FanSelect.Ozel when _customCpu != null && _customGpu != null => (_customCpu, _customGpu),
+        FanSelect.Sabit => (FixedCurve(_fixedCpuSpeed), FixedCurve(_fixedGpuSpeed)),
+        _ => null
+    };
+
+    private byte ExpectedMode => _intent == FanSelect.Otomatik ? ModeAuto : ModeAdvanced;
+
+    /// <summary>İstenen eğrileri ve modu EC'ye yazar.</summary>
+    private bool WriteIntent()
+    {
+        bool ok = true;
+        if (ExpectedCurves() is var (cpu, gpu))
+            ok = WriteCurve(AddrCpuTemps, AddrCpuSpeeds, cpu) & WriteCurve(AddrGpuTemps, AddrGpuSpeeds, gpu);
+        return ok & SetMode(ExpectedMode);
+    }
+
+    /// <summary>
+    /// EC hâlâ istenen durumda mı? Başka bir yazılım (ör. MSI Center) değiştirdiyse yeniden yazar.
+    /// Tek bir hatalı okumaya kanmamak için art arda iki denetimde de farklı görünmesi beklenir.
+    /// </summary>
+    private void Enforce()
+    {
+        if (_intent == FanSelect.Bilinmiyor) return;
+        bool same = (Read(AddrFanMode) & ModeMask) == ExpectedMode;
+        if (same && ExpectedCurves() is var (cpu, gpu))
+            same = ReadCurve(AddrCpuTemps, AddrCpuSpeeds).SameAs(cpu) && ReadCurve(AddrGpuTemps, AddrGpuSpeeds).SameAs(gpu);
+
+        if (same) { _mismatch = 0; return; }
+        if (++_mismatch < 2) return;
+        _mismatch = 0;
+        if (WriteIntent())
+            _state = _state with { Message = "Fan ayarı dışarıdan değiştirilmişti (ör. MSI Center); yeniden uygulandı." };
+    }
+
+    private static FanCurve FixedCurve(int speed) =>
+        new((int[])FixedTemps.Clone(), new[] { speed, speed, speed, speed, speed, speed, FanCurve.MaxSpeed });
+
+    /// <summary>Hedef devir için başlangıç hızı: fan dönüyorsa ölçülen hız/devir oranından, dönmüyorsa kaba tahminle.</summary>
+    private static int GuessSpeed(int target, int rpm, int percent, int? current)
+    {
+        int speed = rpm > 300 && percent > 0 ? (int)Math.Round(percent * (double)target / rpm)
+                  : current ?? (int)Math.Round(target / 41.3); // tam hız (150) ≈ 6200 RPM
+        return Math.Clamp(speed, FixedMinSpeed, FanCurve.MaxSpeed);
+    }
+
+    /// <summary>Sabit devir modunda ölçülen devre göre hız değerini hedefe yaklaştırır.</summary>
+    private void Correct(ref int speed, int rpm, float? temp, byte speedAddr, int target)
+    {
+        if (temp >= FixedSafetyTemp) return; // güvenlik kademesindeyken fan zaten tam hızda
+        int next;
+        if (rpm < 300) next = speed + 10; // fan durmuş ya da yeni kalkıyor
+        else
+        {
+            double ratio = (double)target / rpm;
+            if (Math.Abs(ratio - 1) < 0.04) return; // yeterince yakın
+            next = (int)Math.Round(speed * (1 + 0.6 * (ratio - 1))); // ani salınım olmasın diye kısmi düzeltme
+            if (next == speed) next += ratio > 1 ? 1 : -1;
+        }
+        next = Math.Clamp(next, FixedMinSpeed, FanCurve.MaxSpeed);
+        if (next == speed) return;
+        speed = next;
+        for (int i = 0; i < 6; i++) Write((byte)(speedAddr + i), (byte)next);
+    }
+
     private bool SetMode(byte mode) => Write(AddrFanMode, (byte)((Read(AddrFanMode) & ~ModeMask) | mode));
 
     private bool SetBoostBit(bool on)
@@ -354,22 +406,11 @@ public sealed class FanController : IDisposable
         return Write(AddrBoost, (byte)(on ? cur | BoostBit : cur & ~BoostBit));
     }
 
-    private void ReloadCurves(string message)
-    {
-        _state = _state with
-        {
-            Cpu = ReadCurve(AddrCpuTemps, AddrCpuSpeeds),
-            Gpu = ReadCurve(AddrGpuTemps, AddrGpuSpeeds),
-            Revision = ++_revision
-        };
-        RefreshStatus(message);
-    }
-
     // ---------------- Her turda: sıcaklık koruması + durum ----------------
 
     /// <summary>
-    /// Sıcaklık korumasını işletir ve fan durumunu günceller.
-    /// Koruma açıksa, sıcaklık eşiği aşıldığında fanlar tam hıza alınır; sıcaklık düşünce geri bırakılır.
+    /// Sıcaklık korumasını işletir, EC'nin istenen durumda kaldığını denetler, sabit devir modunda
+    /// hızı düzeltir ve fan durumunu günceller.
     /// </summary>
     public void Tick(float? cpuTemp, float? gpuTemp, bool protectionEnabled, int protectionTemp)
     {
@@ -387,7 +428,18 @@ public sealed class FanController : IDisposable
                 _autoBoost = want;
                 SetBoostBit(_manualBoost || _autoBoost);
             }
-            AdjustFixed(cpuTemp, gpuTemp);
+
+            if (DateTime.UtcNow - _lastCheck >= TimeSpan.FromSeconds(3))
+            {
+                _lastCheck = DateTime.UtcNow;
+                Enforce();
+                // Tam hız açıkken devir ölçümü hedefi yansıtmaz; düzeltme yapma
+                if (_intent == FanSelect.Sabit && _mismatch == 0 && (Read(AddrBoost) & BoostBit) == 0)
+                {
+                    Correct(ref _fixedCpuSpeed, ReadRpm(AddrCpuRpm), cpuTemp, AddrCpuSpeeds, _fixedCpuRpm);
+                    Correct(ref _fixedGpuSpeed, ReadRpm(AddrGpuRpm), gpuTemp, AddrGpuSpeeds, _fixedGpuRpm);
+                }
+            }
             RefreshStatus();
         }
         catch { }
@@ -395,7 +447,16 @@ public sealed class FanController : IDisposable
 
     private void RefreshStatus(string? message = null)
     {
-        byte mode = (byte)(Read(AddrFanMode) & ModeMask);
+        // Mod, programın istediği moddur; program henüz bir şey uygulamadıysa EC'den okunur
+        var select = _intent;
+        if (select == FanSelect.Bilinmiyor)
+            select = (Read(AddrFanMode) & ModeMask) switch
+            {
+                ModeAuto => FanSelect.Otomatik,
+                ModeAdvanced => FanSelect.Ozel,
+                _ => FanSelect.Bilinmiyor
+            };
+
         _state = _state with
         {
             CpuPercent = Read(AddrCpuPercent),
@@ -403,16 +464,12 @@ public sealed class FanController : IDisposable
             CpuRpm = ReadRpm(AddrCpuRpm),
             GpuRpm = ReadRpm(AddrGpuRpm),
             Boost = (Read(AddrBoost) & BoostBit) != 0,
+            ManualBoost = _manualBoost,
             AutoBoostActive = _autoBoost,
-            FixedRpm = _fixedRpm,
+            Selected = select,
+            FixedCpuRpm = _intent == FanSelect.Sabit ? _fixedCpuRpm : null,
+            FixedGpuRpm = _intent == FanSelect.Sabit ? _fixedGpuRpm : null,
             Perf = ToPerfMode(Read(AddrShift)),
-            Mode = mode switch
-            {
-                ModeAuto => FanEcMode.Otomatik,
-                ModeBasic => FanEcMode.Temel,
-                ModeAdvanced => FanEcMode.Ozel,
-                _ => FanEcMode.Bilinmiyor
-            },
             Message = message ?? _state.Message
         };
     }

@@ -91,13 +91,8 @@ public sealed class TrayApp : ApplicationContext
         fans.ProtectionEnabled = _settings.FanProtection;
         fans.ProtectionTemp = _settings.FanProtectionTemp;
 
-        if (_settings is { CpuFanTemps: not null, CpuFanSpeeds: not null, GpuFanTemps: not null, GpuFanSpeeds: not null })
-            fans.SavedCustom = (new FanCurve(_settings.CpuFanTemps, _settings.CpuFanSpeeds),
-                                new FanCurve(_settings.GpuFanTemps, _settings.GpuFanSpeeds));
-
         fans.ApplyRequested += (cpu, gpu) =>
         {
-            fans.SavedCustom = (cpu.Copy(), gpu.Copy());
             _settings.FanStartup = FanStartup.Ozel;
             _settings.CpuFanTemps = cpu.Temps; _settings.CpuFanSpeeds = cpu.Speeds;
             _settings.GpuFanTemps = gpu.Temps; _settings.GpuFanSpeeds = gpu.Speeds;
@@ -111,13 +106,16 @@ public sealed class TrayApp : ApplicationContext
             FanCommand(f => f.SetAuto());
         };
         fans.BoostRequested += on => FanCommand(f => f.SetManualBoost(on));
-        fans.FixedTarget = Math.Clamp(_settings.FanFixedRpm, FanController.FixedMinRpm, FanController.FixedMaxRpm);
-        fans.FixedRequested += rpm =>
+        var (cpuRpm, gpuRpm) = SavedFixedRpm();
+        fans.FixedCpuTarget = cpuRpm;
+        fans.FixedGpuTarget = gpuRpm;
+        fans.FixedRequested += (cpu, gpu) =>
         {
             _settings.FanStartup = FanStartup.SabitDevir;
-            _settings.FanFixedRpm = rpm;
+            _settings.FanFixedCpuRpm = cpu;
+            _settings.FanFixedGpuRpm = gpu;
             _settings.Save();
-            FanCommand(f => f.SetFixedRpm(rpm));
+            FanCommand(f => f.SetFixedRpm(cpu, gpu));
         };
         fans.ProtectionChanged += (enabled, temp) =>
         {
@@ -212,19 +210,34 @@ public sealed class TrayApp : ApplicationContext
     {
         if (_settings.PerfStartup is PerfMode perf) fan.SetPerfMode(perf);
 
+        // Kayıtlı özel eğri, hangi modda açılırsa açılsın eğri düzenleyicide görünsün
+        FanCurve? cpu = null, gpu = null;
+        if (_settings is { CpuFanTemps: not null, CpuFanSpeeds: not null, GpuFanTemps: not null, GpuFanSpeeds: not null })
+        {
+            cpu = new FanCurve(_settings.CpuFanTemps, _settings.CpuFanSpeeds);
+            gpu = new FanCurve(_settings.GpuFanTemps, _settings.GpuFanSpeeds);
+            fan.RememberCustom(cpu, gpu);
+        }
+
         switch (_settings.FanStartup)
         {
-            case FanStartup.Ozel when _settings is { CpuFanTemps: not null, CpuFanSpeeds: not null, GpuFanTemps: not null, GpuFanSpeeds: not null }:
-                fan.ApplyCustom(new FanCurve(_settings.CpuFanTemps, _settings.CpuFanSpeeds),
-                                new FanCurve(_settings.GpuFanTemps, _settings.GpuFanSpeeds));
+            case FanStartup.Ozel when cpu != null && gpu != null:
+                fan.ApplyCustom(cpu, gpu);
                 break;
             case FanStartup.Otomatik:
                 fan.SetAuto();
                 break;
             case FanStartup.SabitDevir:
-                fan.SetFixedRpm(_settings.FanFixedRpm);
+                var (cpuRpm, gpuRpm) = SavedFixedRpm();
+                fan.SetFixedRpm(cpuRpm, gpuRpm);
                 break;
         }
+    }
+
+    private (int cpu, int gpu) SavedFixedRpm()
+    {
+        static int Clamp(int v) => Math.Clamp(v, FanController.FixedMinRpm, FanController.FixedMaxRpm);
+        return (Clamp(_settings.FanFixedCpuRpm ?? _settings.FanFixedRpm), Clamp(_settings.FanFixedGpuRpm ?? _settings.FanFixedRpm));
     }
 
     private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
@@ -330,7 +343,7 @@ public sealed class TrayApp : ApplicationContext
     /// <summary>Fan komutu işlendiğinde, son sensör verisiyle birlikte fan ve performans sayfalarını hemen günceller.</summary>
     private void OnFanState(FanState state)
     {
-        var s = _dashboard.View.Data with { Fan = state };
+        var s = _dashboard.View.Data with { Fan = _fanState.CommandSeq >= state.CommandSeq ? _fanState : state };
         UpdatePerfMenu(s);
         _dashboard.Fans.SetData(s);
         if (_dashboard.IsPageVisible(_dashboard.Fans)) _dashboard.Fans.Invalidate();
@@ -347,6 +360,8 @@ public sealed class TrayApp : ApplicationContext
 
     private void OnData(Snapshot s)
     {
+        // Sensör okuması sürerken fan durumu değişmiş olabilir; her zaman en yenisini göster
+        s = s with { Fan = _fanState };
         // Fan komutları döngüyü erken uyandırabilir; geçmişe saniyede en fazla bir örnek ekle
         if (DateTime.UtcNow - _lastHistory >= TimeSpan.FromMilliseconds(900))
         {

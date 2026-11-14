@@ -22,7 +22,9 @@ public sealed class Settings
     public int[]? GpuFanSpeeds { get; set; }
     public bool FanProtection { get; set; }          // sıcaklık eşiği aşılınca tam hız
     public int FanProtectionTemp { get; set; } = 90;
-    public int FanFixedRpm { get; set; } = 3000;     // sabit devir modunun hedefi
+    public int FanFixedRpm { get; set; } = 3000;     // eski tek hedef; ayrı hedefler yoksa ikisine de bu kullanılır
+    public int? FanFixedCpuRpm { get; set; }         // sabit devir: işlemci fanı hedefi
+    public int? FanFixedGpuRpm { get; set; }         // sabit devir: ekran kartı fanı hedefi
 
     /// <summary>Program açılırken uygulanacak performans modu (null: dokunma).</summary>
     public PerfMode? PerfStartup { get; set; }
