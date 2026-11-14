@@ -6,7 +6,7 @@ public enum PanelMode { Otomatik, HerZaman, Kapali }
 public enum Corner { SolUst, SagUst, SolAlt, SagAlt }
 
 /// <summary>Program açılırken fanlara ne yapılacağı. Dokunma: EC'de ne varsa o kalır.</summary>
-public enum FanStartup { Dokunma, Otomatik, Ozel }
+public enum FanStartup { Dokunma, Otomatik, Ozel, SabitDevir }
 
 public sealed class Settings
 {
@@ -22,6 +22,7 @@ public sealed class Settings
     public int[]? GpuFanSpeeds { get; set; }
     public bool FanProtection { get; set; }          // sıcaklık eşiği aşılınca tam hız
     public int FanProtectionTemp { get; set; } = 90;
+    public int FanFixedRpm { get; set; } = 3000;     // sabit devir modunun hedefi
 
     /// <summary>Program açılırken uygulanacak performans modu (null: dokunma).</summary>
     public PerfMode? PerfStartup { get; set; }

@@ -76,6 +76,8 @@ public sealed record FanState
     public PerfMode Perf { get; init; } = PerfMode.Bilinmiyor;
     public bool Boost { get; init; }            // Cooler Boost şu an açık
     public bool AutoBoostActive { get; init; }  // sıcaklık koruması tarafından açıldı
+    public int? FixedRpm { get; init; }         // sabit devir modundaysa hedef RPM
+    public int CommandSeq { get; init; }        // EC'ye işlenmiş son arayüz komutunun sıra numarası
     public FanCurve? Cpu { get; init; }
     public FanCurve? Gpu { get; init; }
     public FanCurve? FactoryCpu { get; init; }

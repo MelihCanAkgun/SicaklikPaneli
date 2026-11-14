@@ -30,9 +30,13 @@ public sealed class TrayApp : ApplicationContext
     private volatile bool _rtssActive;
     private readonly bool _rtssInstalled = RtssOsd.FindExe() != null;
 
-    // Fan komutları arayüzden sensör iş parçacığına bu kuyrukla aktarılır (EC'ye tek yerden erişilir)
-    private readonly ConcurrentQueue<Action<FanController>> _fanCommands = new();
+    // Fan komutları arayüzden fan iş parçacığına bu kuyrukla aktarılır (EC'ye tek yerden erişilir).
+    // Fan iş parçacığı sensör okumasından ayrıdır; yavaş bir sensör okuması tıklamaları bekletmez.
+    private readonly ConcurrentQueue<(int seq, Action<FanController> run)> _fanCommands = new();
     private readonly AutoResetEvent _wake = new(false);
+    private int _commandSeq;
+    private volatile FanState _fanState = FanState.Unavailable("Fan bilgisi bekleniyor…");
+    private volatile Snapshot _lastSensors = Snapshot.Empty;
     private DateTime _lastHistory = DateTime.MinValue;
 
     private ToolStripMenuItem _modeAuto = null!, _modeAlways = null!, _modeOff = null!, _autostart = null!,
@@ -72,6 +76,7 @@ public sealed class TrayApp : ApplicationContext
         _uiTimer.Start();
 
         Task.Run(() => SensorLoop(_cts.Token));
+        Task.Run(() => FanLoop(_cts.Token));
 
         // Elle açıldıysa ana pencereyi göster; Windows ile başladıysa simge durumunda kal
         if (!Environment.GetCommandLineArgs().Contains("--gizli", StringComparer.OrdinalIgnoreCase))
@@ -86,8 +91,13 @@ public sealed class TrayApp : ApplicationContext
         fans.ProtectionEnabled = _settings.FanProtection;
         fans.ProtectionTemp = _settings.FanProtectionTemp;
 
+        if (_settings is { CpuFanTemps: not null, CpuFanSpeeds: not null, GpuFanTemps: not null, GpuFanSpeeds: not null })
+            fans.SavedCustom = (new FanCurve(_settings.CpuFanTemps, _settings.CpuFanSpeeds),
+                                new FanCurve(_settings.GpuFanTemps, _settings.GpuFanSpeeds));
+
         fans.ApplyRequested += (cpu, gpu) =>
         {
+            fans.SavedCustom = (cpu.Copy(), gpu.Copy());
             _settings.FanStartup = FanStartup.Ozel;
             _settings.CpuFanTemps = cpu.Temps; _settings.CpuFanSpeeds = cpu.Speeds;
             _settings.GpuFanTemps = gpu.Temps; _settings.GpuFanSpeeds = gpu.Speeds;
@@ -101,6 +111,14 @@ public sealed class TrayApp : ApplicationContext
             FanCommand(f => f.SetAuto());
         };
         fans.BoostRequested += on => FanCommand(f => f.SetManualBoost(on));
+        fans.FixedTarget = Math.Clamp(_settings.FanFixedRpm, FanController.FixedMinRpm, FanController.FixedMaxRpm);
+        fans.FixedRequested += rpm =>
+        {
+            _settings.FanStartup = FanStartup.SabitDevir;
+            _settings.FanFixedRpm = rpm;
+            _settings.Save();
+            FanCommand(f => f.SetFixedRpm(rpm));
+        };
         fans.ProtectionChanged += (enabled, temp) =>
         {
             _settings.FanProtection = enabled;
@@ -180,9 +198,12 @@ public sealed class TrayApp : ApplicationContext
         Task.Run(() => PowerPlan.Apply(mode));
     }
 
+    /// <summary>Komutu fan iş parçacığına gönderir. Fan sayfası, bu sıra numarası işlenene kadar seçimi "bekliyor" gösterir.</summary>
     private void FanCommand(Action<FanController> command)
     {
-        _fanCommands.Enqueue(command);
+        int seq = ++_commandSeq;
+        _dashboard.Fans.PendingSeq = seq;
+        _fanCommands.Enqueue((seq, command));
         _wake.Set();
     }
 
@@ -200,6 +221,9 @@ public sealed class TrayApp : ApplicationContext
             case FanStartup.Otomatik:
                 fan.SetAuto();
                 break;
+            case FanStartup.SabitDevir:
+                fan.SetFixedRpm(_settings.FanFixedRpm);
+                break;
         }
     }
 
@@ -213,31 +237,67 @@ public sealed class TrayApp : ApplicationContext
 
     // ---------------- Sensör okuma (arka planda) ----------------
 
-    private void SensorLoop(CancellationToken ct)
+    /// <summary>
+    /// EC (fan) iş parçacığı: komutları gelir gelmez işler ve sonucu hemen arayüze gönderir;
+    /// boşta saniyede bir sıcaklık korumasını ve sabit devir ayarını işletir.
+    /// </summary>
+    private void FanLoop(CancellationToken ct)
     {
-        Sensors? sensors = null;
         FanController? fan = null;
         try
         {
-            sensors = new Sensors();
             fan = new FanController();
             if (fan.State.Available) ApplySavedFanSettings(fan);
+            int done = 0;
+            _fanState = fan.State;
 
             var waitHandles = new[] { ct.WaitHandle, _wake };
+            while (!ct.IsCancellationRequested)
+            {
+                bool ran = false;
+                while (_fanCommands.TryDequeue(out var command))
+                {
+                    try { command.run(fan); } catch { }
+                    done = command.seq;
+                    ran = true;
+                }
+
+                var sensors = _lastSensors;
+                fan.Tick(sensors.CpuTemp, sensors.GpuTemp, _settings.FanProtection, _settings.FanProtectionTemp);
+                _fanState = fan.State with { CommandSeq = done };
+
+                // Komut sonucu sensör döngüsünü beklemeden arayüze gitsin
+                if (ran)
+                {
+                    var state = _fanState;
+                    _ui.Post(_ => OnFanState(state), null);
+                }
+                WaitHandle.WaitAny(waitHandles, 1000);
+            }
+        }
+        catch { }
+        finally
+        {
+            fan?.Dispose();
+        }
+    }
+
+    private void SensorLoop(CancellationToken ct)
+    {
+        Sensors? sensors = null;
+        try
+        {
+            sensors = new Sensors();
+
             int tick = 0;
             while (!ct.IsCancellationRequested)
             {
-                while (_fanCommands.TryDequeue(out var command))
-                {
-                    try { command(fan); } catch { }
-                }
-
                 Snapshot snap;
                 try { snap = sensors.Read(); }
                 catch { snap = Snapshot.Empty; }
 
-                fan.Tick(snap.CpuTemp, snap.GpuTemp, _settings.FanProtection, _settings.FanProtectionTemp);
-                snap = snap with { Fan = fan.State };
+                _lastSensors = snap;
+                snap = snap with { Fan = _fanState };
 
                 // Oyun içi gösterge (RTSS): özel tam ekranda da görünür
                 if (_settings.Mode != PanelMode.Kapali)
@@ -253,7 +313,7 @@ public sealed class TrayApp : ApplicationContext
                 tick++;
 
                 _ui.Post(_ => OnData(snap), null);
-                WaitHandle.WaitAny(waitHandles, 1000);
+                ct.WaitHandle.WaitOne(1000);
             }
         }
         catch (Exception ex)
@@ -263,9 +323,26 @@ public sealed class TrayApp : ApplicationContext
         }
         finally
         {
-            fan?.Dispose();
             sensors?.Dispose();
         }
+    }
+
+    /// <summary>Fan komutu işlendiğinde, son sensör verisiyle birlikte fan ve performans sayfalarını hemen günceller.</summary>
+    private void OnFanState(FanState state)
+    {
+        var s = _dashboard.View.Data with { Fan = state };
+        UpdatePerfMenu(s);
+        _dashboard.Fans.SetData(s);
+        if (_dashboard.IsPageVisible(_dashboard.Fans)) _dashboard.Fans.Invalidate();
+        _dashboard.Perf.Data = s;
+        if (_dashboard.IsPageVisible(_dashboard.Perf)) _dashboard.Perf.Invalidate();
+    }
+
+    private void UpdatePerfMenu(Snapshot s)
+    {
+        _perfTurbo.Checked = s.Fan.Perf == PerfMode.Turbo;
+        _perfBalanced.Checked = s.Fan.Perf == PerfMode.Dengeli;
+        _perfTurbo.Enabled = _perfBalanced.Enabled = s.Fan.Available && s.Fan.Perf != PerfMode.Bilinmiyor;
     }
 
     private void OnData(Snapshot s)
@@ -280,9 +357,7 @@ public sealed class TrayApp : ApplicationContext
 
         UpdateTrayIcon(s);
         _overlay.SetData(s);
-        _perfTurbo.Checked = s.Fan.Perf == PerfMode.Turbo;
-        _perfBalanced.Checked = s.Fan.Perf == PerfMode.Dengeli;
-        _perfTurbo.Enabled = _perfBalanced.Enabled = s.Fan.Available && s.Fan.Perf != PerfMode.Bilinmiyor;
+        UpdatePerfMenu(s);
 
         var view = _dashboard.View;
         view.Data = s;
