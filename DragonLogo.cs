@@ -49,11 +49,11 @@ public static class DragonLogo
         "KwHKhwwwwwHKKWDWKHhKKKKKK.......",
         "KHwwhwwwwwHKKWDWKRHhLLLLLK......",
         "KHwwhwwwwwHKKWDKLRRRRRRRRLK.....",
-        "KHwwhKwwKwHKKDKLRRRRKEEEKRLKK...",
-        "KHwwKDKKDKKDKKKRRRRREKEKERRLLK..",
-        "KHKKDDKDDKLRLLLRRRRREEKEERRRKLK.",
-        ".KKKRRLRRLRRRRRRRRRREKEKERRRRRK.",
-        ".KLLRRRRRRRRRRRRRRRRKEEEKRRRRRK.",
+        "KHwwhKwwKwHKKDKLRRRRKKRKKRLKK...",
+        "KHwwKDKKDKKDKKKRRRRRRKKKRRRLLK..",
+        "KHKKDDKDDKLRLLLRRRRRRKKKRRRRKLK.",
+        ".KKKRRLRRLRRRRRRRRRRKKRKKRRRRRK.",
+        ".KLLRRRRRRRRRRRRRRRRKRRRKRRRRRK.",
         "KLRRRRRRRRRRRRRRRRRRRRRRRRRRRRLK",
         "KRRRRRRRRRRRRRRRRRRRRRRRRRKKKKK.",
         "KRRRRRRRRRRRRRRRDRRRRKKKKKSTTKK.",
@@ -65,33 +65,73 @@ public static class DragonLogo
         "........GGGGGGGGGGGGGGGG........",
     };
 
-    /// <summary>16x16: küçük boyutlar için yalnızca kafa (çarpı göz ve dil okunabilsin diye).</summary>
+    /// <summary>32x32: yalnızca kafa (görev çubuğu ve büyük simgeler).</summary>
+    public static readonly string[] Head =
+    {
+        "................................",
+        "................................",
+        "................................",
+        "........K.......................",
+        ".......KHK......................",
+        ".K.....KHK......................",
+        "KHK....KHHK.....................",
+        ".KHK...KHHK.....................",
+        ".KhHK..KhHHK....................",
+        "..KHHK..KHHK....................",
+        "..KhHHKKLRRKKK..................",
+        "...KHRLLRRRLLLKKK...............",
+        "...KRRRRRRRRRRLLLKKK............",
+        "..KLRRRRRRRDDDDDDLLLKKKK........",
+        "KKLRRRRRRRDRRRRRRDDRLLLLKKKK....",
+        "DDRRRRRRRRRRKKRKKRRRRRRRLLLLK...",
+        "KDRRRRRRRRRRRKKKRRRRRRRRRRRRLK..",
+        "KRRRRRRRRRRRRKKKRRRRRRRRRRRKKLK.",
+        "KRRRRRRRRRRRKKRKKRRRRRRRRRRRRRLK",
+        "KRRRRRRRRRRRKRRRKRRRRRRRRRRRRRDK",
+        "KDRRRRRRRRRRRRRRRRRRRRRRRRRRRRK.",
+        "DDRRRRRRRRRRRRRRRRRRRRRRRRRRRDK.",
+        "KKDRRRRRRRRRRRRRDDDDDSDDDSDDDK..",
+        "..KDRRRRRRRRRRKKKKKKKKKKKKKKK...",
+        "...KDRRRRRRRRRRRLLLLKKKKttTTTK..",
+        "....KDRRRRRRRRRRRRRRLLLSLLLLTTK.",
+        ".....KRRRRRRRRRRRRRRRRRRRRRRKTTK",
+        ".....KDDDDDDDDDDDDDDDDDDDDDDKTTt",
+        "......KKKKKKKKKKKKKKKKKKKKKKKKtt",
+        ".GGGGGGGGGGGGGGGGGGGGGGGGGGGKKKK",
+        "...GGGGGGGGGGGGGGGGGGGGGGGGGG...",
+        "................................",
+    };
+
+    /// <summary>16x16: küçük simge boyutları için sade kafa.</summary>
     public static readonly string[] Small =
     {
         "................",
-        "...K............",
-        "..KWK...........",
-        ".KWLK...........",
-        "KWLLHKKKK.......",
-        "KWLLHHLLLK......",
-        "KWLLRHRRRLKK....",
-        "KLLRRRKEKRLLK...",
-        "KLRRRREKERRRLK..",
-        ".KRRRRKEKRRRKLK.",
-        ".KDRRRRRRRRRRRK.",
-        "..KRRRRRRRRRRRK.",
-        "..KDRRRRKKKKKKK.",
-        "...KDDDDDDDDTTK.",
-        "...GKKKKKKKKKTtK",
+        ".K..............",
+        "KHK.............",
+        ".KHK............",
+        ".KHHKKKK........",
+        "..KHLLLLKK......",
+        "..KRRRRRLLKK....",
+        ".KLRRRKRKRLLK...",
+        "KLRRRRRKRRRRLK..",
+        "KRRRRRKRKRRRKLK.",
+        "KDRRRRRRRRRRRRK.",
+        ".KRRRRRRRRRRRRLK",
+        ".KDRRRRRKKKKKKK.",
+        "..KDDDDDDDDDTTK.",
+        "...KKKKKKKKKKTtK",
         ".GGGGGGGGGGGGKK.",
     };
 
-    private static readonly Lazy<Bitmap> Cached = new(() => Render(32));
+    private static readonly Lazy<Bitmap> Cached = new(() => Render(32, headOnly: false));
 
-    /// <summary>Piksel verisini verilen boyutta (en yakın komşu, keskin) bir bitmap'e çizer.</summary>
-    public static Bitmap Render(int size)
+    /// <summary>
+    /// Piksel verisini verilen boyutta (en yakın komşu, keskin) bir bitmap'e çizer.
+    /// headOnly: simge için yalnızca kafa; false: pencere içindeki tüm ejderha.
+    /// </summary>
+    public static Bitmap Render(int size, bool headOnly = true)
     {
-        var grid = size < 32 ? Small : Large;
+        var grid = size < 32 ? Small : headOnly ? Head : Large;
         var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         int n = grid.Length;
         for (int y = 0; y < size; y++)

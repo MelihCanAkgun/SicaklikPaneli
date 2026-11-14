@@ -50,14 +50,15 @@ public abstract class PanelView : Control
     private void DrawHeader(Graphics g, float scale)
     {
         // Logo: piksel sanatı bulanıklaşmasın diye ekranda tam sayı katında ve piksel ızgarasına oturtulmuş çizilir
-        int k = Math.Max(1, (int)Math.Round(34 * scale / 32));
+        int k = Math.Max(2, (int)(56 * scale / 32));
         float logo = k * 32 / scale;
-        float lx = MathF.Round(18 * scale) / scale, ly = MathF.Round((35 - logo / 2) * scale) / scale;
+        // Çizimin üstteki 4 satırı boş; dolu kısmı başlık satırının ortasına (y=35) gelsin
+        float lx = MathF.Round(14 * scale) / scale, ly = MathF.Round((35 - logo * 18 / 32) * scale) / scale;
         DragonLogo.Draw(g, new RectangleF(lx, ly, logo, logo));
 
-        using var title = Theme.Font(20, true);
+        using var title = Theme.Font(22, true);
         using var tb = new SolidBrush(Theme.Text);
-        g.DrawString("Dragon Saj", title, tb, lx + logo + 8, 21);
+        g.DrawString("Dragon Saj", title, tb, lx + logo + 6, 20);
 
         // Sekmeler
         using var tabFont = Theme.Font(14, true);
