@@ -1,5 +1,65 @@
+
+# Kullanıcıya özel
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+# Derleme çıktıları
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]64/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+publish/
+artifacts/
+*.exe
+*.dll
+*.pdb
+*.msi
+*.zip
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.DotSettings.user
+_ReSharper*/
+*.ncrunch*
+
+# NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+project.lock.json
+project.fragment.lock.json
+
+# Test / kapsam
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+coverage*.json
+coverage*.xml
+
+# İmzalama anahtarları / sırlar
+*.pfx
+*.snk
+*.publishsettings
+appsettings.*.local.json
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Önceki girişler
 bin/
 obj/
-.vs/
-*.user
-*.suo
