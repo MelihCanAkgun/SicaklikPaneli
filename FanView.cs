@@ -8,6 +8,8 @@ public sealed class FanView : PanelView
     private const float AxisTempMin = 30, AxisTempMax = 100, AxisSpeedMax = 150;
     private static readonly RectangleF CurveCard = new(20, 176, 560, 336);
     private static readonly RectangleF Plot = new(CurveCard.X + 52, CurveCard.Y + 60, CurveCard.Width - 52 - 26, CurveCard.Height - 60 - 44);
+    /// <summary>Bekleyen bir komutun EC tarafından işlenmesi için beklenen en uzun süre.</summary>
+    private static readonly TimeSpan PendingTimeout = TimeSpan.FromSeconds(6);
 
     public Snapshot Data = Snapshot.Empty;
     public bool ProtectionEnabled;
@@ -42,6 +44,9 @@ public sealed class FanView : PanelView
     private bool _dirty, _editGpu;
     private int _drag = -1, _hoverHandle = -1;
     private string _localMessage = "";
+    // Uygulanan eğri komutunun sıra numarası: EC işleyene kadar düzenleyiciye eski eğri geri yüklenmez
+    private int _applySeq;
+    private DateTime _applyAt;
 
     private static readonly (string name, FanCurve cpu, FanCurve gpu)[] Presets =
     {
@@ -56,20 +61,133 @@ public sealed class FanView : PanelView
             new FanCurve(new[] { 50, 56, 62, 68, 75, 82 }, new[] { 40, 55, 70, 90, 120, 150, 150 })),
     };
 
+    // ---------------- Önbellekteki çizim nesneleri ----------------
+    // Her karede yeniden oluşturulup atılmasınlar diye bir kez oluşturulur; yalnızca arayüz iş parçacığında kullanılır.
+
+    private static readonly Font Font11 = Theme.Font(11), Font11Bold = Theme.Font(11, true), Font12 = Theme.Font(12),
+        Font13 = Theme.Font(13), Font18Bold = Theme.Font(18, true);
+    private static readonly Font Number26 = Theme.Number(26), Number30 = Theme.Number(30), Number32 = Theme.Number(32);
+    // Büyük sayının yanındaki küçük birimin taban çizgisi hizası
+    private static readonly float RpmUnitOffset = Theme.Ascent(Number32) - Theme.Ascent(Font12);
+    private static readonly float TargetUnitOffset = Theme.Ascent(Number30) - Theme.Ascent(Font12);
+
+    private static readonly Color WarnColor = Color.FromArgb(255, 150, 150), YellowColor = Color.FromArgb(240, 220, 90);
+    private static readonly SolidBrush TextBrush = new(Theme.Text), MutedBrush = new(Theme.Muted),
+        DimBrush = new(Color.FromArgb(100, 100, 110)), WarnBrush = new(WarnColor), YellowBrush = new(YellowColor),
+        OkBrush = new(Theme.Ok), CpuBrush = new(Theme.Cpu), GpuBrush = new(Theme.Gpu),
+        CpuAreaBrush = new(Color.FromArgb(34, Theme.Cpu)), GpuAreaBrush = new(Color.FromArgb(34, Theme.Gpu));
+    private static readonly Pen GridPen = new(Color.FromArgb(40, 40, 48), 1), HandleBorderPen = new(Theme.Card, 2),
+        SeparatorPen = new(Theme.CardBorder, 1),
+        LiveDashPen = new(Color.FromArgb(150, Theme.Text), 1) { DashStyle = DashStyle.Dash },
+        CpuCurvePen = new(Theme.Cpu, 2.2f) { LineJoin = LineJoin.Round },
+        GpuCurvePen = new(Theme.Gpu, 2.2f) { LineJoin = LineJoin.Round },
+        CpuRingPen = new(Theme.Cpu, 2), GpuRingPen = new(Theme.Gpu, 2);
+    private static readonly StringFormat CenterFormat = new() { Alignment = StringAlignment.Center },
+        CenterBothFormat = new() { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center },
+        FarFormat = new() { Alignment = StringAlignment.Far },
+        FarCenterFormat = new() { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center },
+        NearFormat = new() { Alignment = StringAlignment.Near };
+
+    // Sabit metinler (her karede yeniden biçimlendirilmesin)
+    private static readonly int[] SpeedGrid = { 0, 50, 100, 150 };
+    private static readonly string[] SpeedGridText = Array.ConvertAll(SpeedGrid, s => $"%{s}");
+    private static readonly string[] TempAxisText = BuildTempAxis();
+    private static readonly string[] SpeedText = BuildSpeedText();
+    private static readonly string SafetyText = $"Güvenlik: {FanController.FixedSafetyTemp}°C üstünde fanlar her durumda tam hıza çıkar.";
+
+    private static string[] BuildTempAxis()
+    {
+        var a = new string[8];
+        for (int i = 0; i < a.Length; i++) a[i] = $"{30 + i * 10}°";
+        return a;
+    }
+
+    private static string[] BuildSpeedText()
+    {
+        var a = new string[FanCurve.MaxSpeed + 1];
+        for (int i = 0; i < a.Length; i++) a[i] = i.ToString();
+        return a;
+    }
+
+    private static string SpeedLabel(int v) => (uint)v < (uint)SpeedText.Length ? SpeedText[v] : v.ToString();
+
+    // Değişince yeniden oluşturulan metinler
+    private int _protTextValue = int.MinValue;
+    private string _protText = "";
+    private string? _firmwareSource;
+    private string _firmwareText = "";
+
+    // Eğri çizimi için yeniden kullanılan nokta dizileri (basamaklı çizgi: 14 nokta, alan: +2 köşe)
+    private readonly PointF[] _curvePts = new PointF[14];
+    private readonly PointF[] _areaPts = new PointF[16];
+
+    // Tıklama işleyicileri bir kez oluşturulur (her çizimde yeni temsilci ayrılmasın)
+    private readonly Action _onAuto, _onCurveMode, _onFixedMode, _onBoost, _onEditCpu, _onEditGpu,
+        _onProtectionToggle, _onProtectionDown, _onProtectionUp, _onFactory, _onRevert, _onApply;
+    private readonly Action[] _onStepDown, _onStepUp, _onPreset;
+
+    public FanView()
+    {
+        _onAuto = () =>
+        {
+            SetPending(Choice.Otomatik);
+            AutoRequested?.Invoke();
+        };
+        _onCurveMode = () =>
+        {
+            // Düzenleyicide her zaman son kaydedilen özel eğri durur (sabit devirde EC'deki düz eğri değil)
+            _forceCurve = true;
+            Apply();
+        };
+        _onFixedMode = RequestFixed;
+        _onBoost = () =>
+        {
+            // Kapatınca alttaki moda dönülür
+            var fan = Data.Fan;
+            bool full = Current(fan) == Choice.TamHiz;
+            SetPending(full ? Underlying(fan) : Choice.TamHiz);
+            BoostRequested?.Invoke(!full);
+        };
+        _onEditCpu = () => _editGpu = false;
+        _onEditGpu = () => _editGpu = true;
+        _onProtectionToggle = () => { ProtectionEnabled = !ProtectionEnabled; ProtectionChanged?.Invoke(ProtectionEnabled, ProtectionTemp); };
+        _onProtectionDown = () => ChangeProtectionTemp(-1);
+        _onProtectionUp = () => ChangeProtectionTemp(+1);
+        _onFactory = () =>
+        {
+            var fan = Data.Fan;
+            if (fan.FactoryCpu != null && fan.FactoryGpu != null) LoadCurves(fan.FactoryCpu, fan.FactoryGpu);
+        };
+        _onRevert = Revert;
+        _onApply = Apply;
+        _onStepDown = new Action[] { () => StepFixed(0, -100), () => StepFixed(1, -100) };
+        _onStepUp = new Action[] { () => StepFixed(0, +100), () => StepFixed(1, +100) };
+        _onPreset = new Action[Presets.Length];
+        for (int i = 0; i < Presets.Length; i++)
+        {
+            var preset = Presets[i];
+            _onPreset[i] = () => LoadCurves(preset.cpu, preset.gpu);
+        }
+    }
+
     /// <summary>Yeni ölçüm geldiğinde çağrılır. Kullanıcı düzenleme yapmıyorsa EC'deki eğriyi yükler.</summary>
     public void SetData(Snapshot s)
     {
         Data = s;
         var fan = s.Fan;
-        if (_pending != Choice.Yok && (fan.CommandSeq >= PendingSeq || DateTime.UtcNow - _pendingAt > TimeSpan.FromSeconds(6)))
+        var now = DateTime.UtcNow;
+        if (_pending != Choice.Yok && (fan.CommandSeq >= PendingSeq || now - _pendingAt > PendingTimeout))
             _pending = Choice.Yok;
         if (_pending == Choice.Yok && _sliderDrag < 0)
         {
             if (fan.FixedCpuRpm is int c) FixedCpuTarget = c;
             if (fan.FixedGpuRpm is int g) FixedGpuTarget = g;
         }
+        // Uygulanan eğri henüz işlenmediyse EC'deki eski eğri düzenleyiciye geri yüklenmesin (kısa süreli geri sıçrama);
+        // sürükleme sırasında da düzenlenen eğri değiştirilmez
+        bool applyInFlight = fan.CommandSeq < _applySeq && now - _applyAt <= PendingTimeout;
         if (fan.Available && fan.Cpu != null && fan.Gpu != null &&
-            (_cpu == null || (fan.Revision != _loadedRevision && !_dirty)))
+            (_cpu == null || (fan.Revision != _loadedRevision && !_dirty && _drag < 0 && !applyInFlight)))
         {
             _cpu = fan.Cpu.Copy();
             _gpu = fan.Gpu.Copy();
@@ -132,13 +250,8 @@ public sealed class FanView : PanelView
     {
         var r = new RectangleF(20, 68, 820, 512);
         DrawCard(g, r);
-        using var big = Theme.Font(18, true);
-        using var font = Theme.Font(13);
-        using var text = new SolidBrush(Theme.Text);
-        using var muted = new SolidBrush(Theme.Muted);
-        var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-        g.DrawString("Fan denetimi kullanılamıyor", big, text, new RectangleF(r.X, r.Y + 190, r.Width, 30), fmt);
-        g.DrawString(message, font, muted, new RectangleF(r.X + 80, r.Y + 228, r.Width - 160, 60), fmt);
+        g.DrawString("Fan denetimi kullanılamıyor", Font18Bold, TextBrush, new RectangleF(r.X, r.Y + 190, r.Width, 30), CenterBothFormat);
+        g.DrawString(message, Font13, MutedBrush, new RectangleF(r.X + 80, r.Y + 228, r.Width - 160, 60), CenterBothFormat);
     }
 
     // ---------------- Üst satır ----------------
@@ -147,16 +260,14 @@ public sealed class FanView : PanelView
     {
         DrawCard(g, r);
         DrawLabel(g, label, r.X + 16, r.Y + 12, color);
-        using var big = Theme.Number(32);
-        using var small = Theme.Font(12);
-        using var text = new SolidBrush(Theme.Text);
-        using var muted = new SolidBrush(Theme.Muted);
         string value = rpm > 0 ? rpm.ToString() : "0";
-        g.DrawString(value, big, text, r.X + 12, r.Y + 32);
-        float w = g.MeasureString(value, big).Width;
-        g.DrawString("RPM", small, muted, r.X + 8 + w, r.Y + 32 + Theme.Ascent(big) - Theme.Ascent(small));
-        string sub = $"%{percent}" + (temp.HasValue ? $"  ·  {temp.Value:0}°C" : "");
-        g.DrawString(rpm > 0 ? sub : "Duruyor" + (temp.HasValue ? $"  ·  {temp.Value:0}°C" : ""), small, muted, r.X + 16, r.Y + 72);
+        g.DrawString(value, Number32, TextBrush, r.X + 12, r.Y + 32);
+        float w = g.MeasureString(value, Number32).Width;
+        g.DrawString("RPM", Font12, MutedBrush, r.X + 8 + w, r.Y + 32 + RpmUnitOffset);
+        string sub = rpm > 0
+            ? temp.HasValue ? $"%{percent}  ·  {temp.Value:0}°C" : $"%{percent}"
+            : temp.HasValue ? $"Duruyor  ·  {temp.Value:0}°C" : "Duruyor";
+        g.DrawString(sub, Font12, MutedBrush, r.X + 16, r.Y + 72);
     }
 
     private void DrawModeCard(Graphics g, RectangleF r, FanState fan)
@@ -165,36 +276,16 @@ public sealed class FanView : PanelView
         DrawLabel(g, "Fan modu", r.X + 16, r.Y + 12);
 
         var current = Current(fan);
-        bool full = current == Choice.TamHiz;
 
         float y = r.Y + 42, gap = 8, w = (r.Width - 32 - 3 * gap) / 4;
         RectangleF Slot(int i) => new(r.X + 16 + i * (w + gap), y, w, 38);
-        Button(g, Slot(0), "Otomatik", current == Choice.Otomatik, () =>
-        {
-            SetPending(Choice.Otomatik);
-            AutoRequested?.Invoke();
-        });
-        Button(g, Slot(1), "Özel eğri", current == Choice.Ozel, () =>
-        {
-            // Düzenleyicide her zaman son kaydedilen özel eğri durur (sabit devirde EC'deki düz eğri değil)
-            _forceCurve = true;
-            Apply();
-        });
-        Button(g, Slot(2), "Sabit devir", current == Choice.Sabit, RequestFixed);
-        Button(g, Slot(3), "Tam hız", full, () =>
-        {
-            // Kapatınca alttaki moda dönülür
-            SetPending(full ? Underlying(fan) : Choice.TamHiz);
-            BoostRequested?.Invoke(!full);
-        });
+        Button(g, Slot(0), "Otomatik", current == Choice.Otomatik, _onAuto);
+        Button(g, Slot(1), "Özel eğri", current == Choice.Ozel, _onCurveMode);
+        Button(g, Slot(2), "Sabit devir", current == Choice.Sabit, _onFixedMode);
+        Button(g, Slot(3), "Tam hız", current == Choice.TamHiz, _onBoost);
 
         if (fan.AutoBoostActive)
-        {
-            using var font = Theme.Font(11, true);
-            using var b = new SolidBrush(Color.FromArgb(255, 150, 150));
-            using var far = new StringFormat { Alignment = StringAlignment.Far };
-            g.DrawString("Sıcaklık koruması etkin", font, b, new RectangleF(r.X, r.Y + 13, r.Width - 16, 16), far);
-        }
+            g.DrawString("Sıcaklık koruması etkin", Font11Bold, WarnBrush, new RectangleF(r.X, r.Y + 13, r.Width - 16, 16), FarFormat);
     }
 
     // ---------------- Eğri düzenleyici ----------------
@@ -211,49 +302,44 @@ public sealed class FanView : PanelView
         DrawCard(g, r);
         DrawLabel(g, "Fan eğrisi", r.X + 18, r.Y + 16);
         Button(g, new RectangleF(r.Right - 18 - 232, r.Y + 10, 112, 28), "İşlemci fanı", !_editGpu,
-            () => _editGpu = false, activeColor: Color.FromArgb(52, 96, 150), fontSize: 12);
+            _onEditCpu, activeColor: Color.FromArgb(52, 96, 150), fontSize: 12);
         Button(g, new RectangleF(r.Right - 18 - 116, r.Y + 10, 116, 28), "Ekran kartı fanı", _editGpu,
-            () => _editGpu = true, activeColor: Color.FromArgb(58, 120, 62), fontSize: 12);
+            _onEditGpu, activeColor: Color.FromArgb(58, 120, 62), fontSize: 12);
 
         var curve = Editing!;
-        Color color = _editGpu ? Theme.Gpu : Theme.Cpu;
-        using var small = Theme.Font(11);
-        using var muted = new SolidBrush(Theme.Muted);
-        using var text = new SolidBrush(Theme.Text);
-        using var grid = new Pen(Color.FromArgb(40, 40, 48), 1);
+        var colorBrush = _editGpu ? GpuBrush : CpuBrush;
 
         // Izgara ve eksenler
-        using var rightFmt = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
-        foreach (int s in new[] { 0, 50, 100, 150 })
+        for (int i = 0; i < SpeedGrid.Length; i++)
         {
-            g.DrawLine(grid, Plot.X, Y(s), Plot.Right, Y(s));
-            g.DrawString($"%{s}", small, muted, new RectangleF(r.X + 4, Y(s) - 8, 44, 16), rightFmt);
+            float sy = Y(SpeedGrid[i]);
+            g.DrawLine(GridPen, Plot.X, sy, Plot.Right, sy);
+            g.DrawString(SpeedGridText[i], Font11, MutedBrush, new RectangleF(r.X + 4, sy - 8, 44, 16), FarCenterFormat);
         }
-        using var centerFmt = new StringFormat { Alignment = StringAlignment.Center };
-        for (int t = 30; t <= 100; t += 10)
+        for (int i = 0, t = 30; t <= 100; i++, t += 10)
         {
-            g.DrawLine(grid, X(t), Plot.Y, X(t), Plot.Bottom);
-            g.DrawString($"{t}°", small, muted, new RectangleF(X(t) - 20, Plot.Bottom + 6, 40, 16), centerFmt);
+            float tx = X(t);
+            g.DrawLine(GridPen, tx, Plot.Y, tx, Plot.Bottom);
+            g.DrawString(TempAxisText[i], Font11, MutedBrush, new RectangleF(tx - 20, Plot.Bottom + 6, 40, 16), CenterFormat);
         }
 
         // Basamaklı eğri
-        var pts = new List<PointF> { new(Plot.X, Y(curve.Speeds[0])) };
+        var pts = _curvePts;
+        pts[0] = new PointF(Plot.X, Y(curve.Speeds[0]));
         for (int i = 0; i < 6; i++)
         {
-            pts.Add(new PointF(X(curve.Temps[i]), Y(curve.Speeds[i])));
-            pts.Add(new PointF(X(curve.Temps[i]), Y(curve.Speeds[i + 1])));
+            float tx = X(curve.Temps[i]);
+            pts[1 + 2 * i] = new PointF(tx, Y(curve.Speeds[i]));
+            pts[2 + 2 * i] = new PointF(tx, Y(curve.Speeds[i + 1]));
         }
-        pts.Add(new PointF(Plot.Right, Y(curve.Speeds[6])));
+        pts[13] = new PointF(Plot.Right, Y(curve.Speeds[6]));
 
-        using (var area = new GraphicsPath())
-        {
-            var poly = new List<PointF>(pts) { new(Plot.Right, Plot.Bottom), new(Plot.X, Plot.Bottom) };
-            area.AddPolygon(poly.ToArray());
-            using var fill = new SolidBrush(Color.FromArgb(34, color));
-            g.FillPath(fill, area);
-        }
-        using (var pen = new Pen(color, 2.2f) { LineJoin = LineJoin.Round })
-            g.DrawLines(pen, pts.ToArray());
+        var area = _areaPts;
+        Array.Copy(pts, area, pts.Length);
+        area[14] = new PointF(Plot.Right, Plot.Bottom);
+        area[15] = new PointF(Plot.X, Plot.Bottom);
+        g.FillPolygon(_editGpu ? GpuAreaBrush : CpuAreaBrush, area);
+        g.DrawLines(_editGpu ? GpuCurvePen : CpuCurvePen, pts);
 
         // Şu anki sıcaklık ve gerçek fan hızı
         float? liveTemp = _editGpu ? Data.GpuTemp : Data.CpuTemp;
@@ -261,35 +347,29 @@ public sealed class FanView : PanelView
         if (liveTemp is float lt)
         {
             float lx = X(Math.Clamp(lt, AxisTempMin, AxisTempMax));
-            using var dash = new Pen(Color.FromArgb(150, Theme.Text), 1) { DashStyle = DashStyle.Dash };
-            g.DrawLine(dash, lx, Plot.Y, lx, Plot.Bottom);
+            g.DrawLine(LiveDashPen, lx, Plot.Y, lx, Plot.Bottom);
             float ly = Y(Math.Clamp(livePercent, 0, AxisSpeedMax));
-            using var wb = new SolidBrush(Theme.Text);
-            g.FillEllipse(wb, lx - 4, ly - 4, 8, 8);
+            g.FillEllipse(TextBrush, lx - 4, ly - 4, 8, 8);
             bool leftSide = lx > Plot.Right - 70;
-            using var fmt = new StringFormat { Alignment = leftSide ? StringAlignment.Far : StringAlignment.Near };
-            g.DrawString($"şu an {lt:0}°", small, text,
-                new RectangleF(leftSide ? lx - 86 : lx + 6, Plot.Y - 2, 80, 16), fmt);
+            g.DrawString($"şu an {lt:0}°", Font11, TextBrush,
+                new RectangleF(leftSide ? lx - 86 : lx + 6, Plot.Y - 2, 80, 16), leftSide ? FarFormat : NearFormat);
         }
 
         // Tutamaklar
-        using var labelFont = Theme.Font(11, true);
         for (int k = 0; k < 7; k++)
         {
             var p = HandlePoint(curve, k);
             bool hot = k == _drag || (k == _hoverHandle && _drag < 0);
             float rad = hot ? 7.5f : 5.5f;
-            using var hb = new SolidBrush(hot ? Color.White : color);
-            using var border = new Pen(Theme.Card, 2);
-            g.FillEllipse(hb, p.X - rad, p.Y - rad, rad * 2, rad * 2);
-            g.DrawEllipse(border, p.X - rad, p.Y - rad, rad * 2, rad * 2);
+            g.FillEllipse(hot ? Brushes.White : colorBrush, p.X - rad, p.Y - rad, rad * 2, rad * 2);
+            g.DrawEllipse(HandleBorderPen, p.X - rad, p.Y - rad, rad * 2, rad * 2);
 
-            string label = k == 0 || !hot ? $"{curve.Speeds[k]}" : $"{curve.Temps[k - 1]}°C · %{curve.Speeds[k]}";
-            float lw = g.MeasureString(label, labelFont).Width;
+            string label = k == 0 || !hot ? SpeedLabel(curve.Speeds[k]) : $"{curve.Temps[k - 1]}°C · %{curve.Speeds[k]}";
+            float lw = g.MeasureString(label, Font11Bold).Width;
             float tx = Math.Clamp(p.X - lw / 2 + (k == 0 ? 10 : 0), Plot.X, Plot.Right - lw);
             float ty = p.Y - 24 < Plot.Y - 14 ? p.Y + 10 : p.Y - 24;
             if (hot) Theme.FillRounded(g, Color.FromArgb(230, 12, 12, 15), new RectangleF(tx - 4, ty - 2, lw + 8, 19), 5);
-            g.DrawString(label, labelFont, hot ? text : muted, tx, ty);
+            g.DrawString(label, Font11Bold, hot ? TextBrush : MutedBrush, tx, ty);
         }
     }
 
@@ -326,19 +406,13 @@ public sealed class FanView : PanelView
         DrawCard(g, r);
         DrawLabel(g, "Sabit devir", r.X + 18, r.Y + 16);
 
-        using var small = Theme.Font(11);
-        using var font = Theme.Font(12);
-        using var muted = new SolidBrush(Theme.Muted);
-        using var far = new StringFormat { Alignment = StringAlignment.Far };
-        g.DrawString("Her fan kendi hedef devrinde tutulur", font, muted, new RectangleF(r.X, r.Y + 16, r.Width - 18, 18), far);
+        g.DrawString("Her fan kendi hedef devrinde tutulur", Font12, MutedBrush, new RectangleF(r.X, r.Y + 16, r.Width - 18, 18), FarFormat);
 
         DrawFixedBlock(g, 0, "İşlemci fanı", Theme.Cpu, fan.CpuRpm, fan.CpuPercent, Data.CpuTemp, fan);
-        using (var sep = new Pen(Theme.CardBorder))
-            g.DrawLine(sep, r.X + 18, BlockY(1) - 10, r.Right - 18, BlockY(1) - 10);
+        g.DrawLine(SeparatorPen, r.X + 18, BlockY(1) - 10, r.Right - 18, BlockY(1) - 10);
         DrawFixedBlock(g, 1, "Ekran kartı fanı", Theme.Gpu, fan.GpuRpm, fan.GpuPercent, Data.GpuTemp, fan);
 
-        g.DrawString($"Güvenlik: {FanController.FixedSafetyTemp}°C üstünde fanlar her durumda tam hıza çıkar.",
-            small, muted, new RectangleF(r.X + 18, r.Bottom - 28, r.Width - 36, 18));
+        g.DrawString(SafetyText, Font11, MutedBrush, new RectangleF(r.X + 18, r.Bottom - 28, r.Width - 36, 18));
     }
 
     private void DrawFixedBlock(Graphics g, int index, string label, Color color, int rpm, int percent, float? temp, FanState fan)
@@ -348,55 +422,48 @@ public sealed class FanView : PanelView
         int target = Target(index);
         int? applied = index == 0 ? fan.FixedCpuRpm : fan.FixedGpuRpm;
 
-        using var font = Theme.Font(12);
-        using var small = Theme.Font(11);
-        using var muted = new SolidBrush(Theme.Muted);
-        using var text = new SolidBrush(Theme.Text);
-        using var far = new StringFormat { Alignment = StringAlignment.Far };
-
         // Başlık ve anlık durum
         DrawLabel(g, label, r.X + 18, y, color);
-        (string status, Color c) = applied == null || _pending == Choice.Sabit || applied != target ? ("Uygulanıyor…", Theme.Muted)
-            : fan.Boost ? ("Tam hız açık", Color.FromArgb(255, 150, 150))
-            : temp >= FanController.FixedSafetyTemp ? ("Sıcak: güvenlik için tam hız", Color.FromArgb(255, 150, 150))
-            : Math.Abs(rpm - target) <= target * 0.06 ? ("Hedefte", Theme.Ok)
-            : percent >= FanCurve.MaxSpeed && rpm < target ? ("Bu devre ulaşamıyor", Color.FromArgb(240, 220, 90))
-            : percent <= FanController.FixedMinSpeed && rpm > target ? ("Daha yavaş dönemiyor", Color.FromArgb(240, 220, 90))
-            : ("Ayarlanıyor…", Theme.Muted);
-        using var sb = new SolidBrush(c);
-        float sw = g.MeasureString(status, font).Width;
-        g.DrawString(status, font, sb, new RectangleF(r.X, y, r.Width - 18, 18), far);
-        g.DrawString($"şu an {rpm} RPM  ·", font, muted, new RectangleF(r.X, y, r.Width - 18 - sw, 18), far);
+        (string status, Brush statusBrush) = applied == null || _pending == Choice.Sabit || applied != target ? ("Uygulanıyor…", MutedBrush)
+            : fan.Boost ? ("Tam hız açık", WarnBrush)
+            : temp >= FanController.FixedSafetyTemp ? ("Sıcak: güvenlik için tam hız", WarnBrush)
+            : Math.Abs(rpm - target) <= target * 0.06 ? ("Hedefte", OkBrush)
+            : percent >= FanCurve.MaxSpeed && rpm < target ? ("Bu devre ulaşamıyor", YellowBrush)
+            : percent <= FanController.FixedMinSpeed && rpm > target ? ("Daha yavaş dönemiyor", YellowBrush)
+            : ("Ayarlanıyor…", MutedBrush);
+        float sw = g.MeasureString(status, Font12).Width;
+        g.DrawString(status, Font12, statusBrush, new RectangleF(r.X, y, r.Width - 18, 18), FarFormat);
+        g.DrawString($"şu an {rpm} RPM  ·", Font12, MutedBrush, new RectangleF(r.X, y, r.Width - 18 - sw, 18), FarFormat);
 
         // Hedef değer ve ince ayar düğmeleri
-        using var big = Theme.Number(30);
         string value = target.ToString();
-        g.DrawString(value, big, text, r.X + 14, y + 22);
-        float vw = g.MeasureString(value, big).Width;
-        g.DrawString("RPM hedef", font, muted, r.X + 10 + vw, y + 22 + Theme.Ascent(big) - Theme.Ascent(font));
-        Button(g, new RectangleF(r.Right - 18 - 36 - 8 - 36, y + 24, 36, 34), "−", false, () => StepFixed(index, -100), fontSize: 18);
-        Button(g, new RectangleF(r.Right - 18 - 36, y + 24, 36, 34), "+", false, () => StepFixed(index, +100), fontSize: 18);
+        g.DrawString(value, Number30, TextBrush, r.X + 14, y + 22);
+        float vw = g.MeasureString(value, Number30).Width;
+        g.DrawString("RPM hedef", Font12, MutedBrush, r.X + 10 + vw, y + 22 + TargetUnitOffset);
+        Button(g, new RectangleF(r.Right - 18 - 36 - 8 - 36, y + 24, 36, 34), "−", false, _onStepDown[index], fontSize: 18);
+        Button(g, new RectangleF(r.Right - 18 - 36, y + 24, 36, 34), "+", false, _onStepUp[index], fontSize: 18);
 
         // Çubuk
         var track = SliderTrack(index);
         float kx = SliderX(index, target);
         Theme.FillRounded(g, Theme.Track, track, 3);
         Theme.FillRounded(g, color, new RectangleF(track.X, track.Y, kx - track.X, track.Height), 3);
-        using var center = new StringFormat { Alignment = StringAlignment.Center };
-        using var tick = new Pen(Theme.CardBorder, 1);
         for (int v = 2000; v <= FanController.FixedMaxRpm; v += 500)
         {
             float tx = SliderX(index, v);
-            g.DrawLine(tick, tx, track.Bottom + 6, tx, track.Bottom + 10);
+            g.DrawLine(SeparatorPen, tx, track.Bottom + 6, tx, track.Bottom + 10);
             if (v % 1000 == 0)
-                g.DrawString(v.ToString(), small, muted, new RectangleF(tx - 24, track.Bottom + 11, 48, 16), center);
+                g.DrawString(RpmTickText(v), Font11, MutedBrush, new RectangleF(tx - 24, track.Bottom + 11, 48, 16), CenterFormat);
         }
         float kr = _sliderDrag == index || _sliderHover == index ? 11 : 9;
         float ky = track.Y + track.Height / 2;
         g.FillEllipse(Brushes.White, kx - kr, ky - kr, kr * 2, kr * 2);
-        using var ring = new Pen(color, 2);
-        g.DrawEllipse(ring, kx - kr, ky - kr, kr * 2, kr * 2);
+        g.DrawEllipse(index == 0 ? CpuRingPen : GpuRingPen, kx - kr, ky - kr, kr * 2, kr * 2);
     }
+
+    // Çubuk altındaki bin RPM etiketleri (2000…6000)
+    private static readonly string[] RpmTicks = { "2000", "3000", "4000", "5000", "6000" };
+    private static string RpmTickText(int v) => (v / 1000 - 2) is int i && (uint)i < (uint)RpmTicks.Length ? RpmTicks[i] : v.ToString();
 
     private void StepFixed(int fan, int delta)
     {
@@ -417,25 +484,23 @@ public sealed class FanView : PanelView
         Theme.FillRounded(g, ProtectionEnabled ? Theme.Accent : Theme.Track, sw, 11);
         float knobX = ProtectionEnabled ? sw.Right - 20 : sw.X + 2;
         g.FillEllipse(Brushes.White, knobX, sw.Y + 2, 18, 18);
-        Hit(sw, () => { ProtectionEnabled = !ProtectionEnabled; ProtectionChanged?.Invoke(ProtectionEnabled, ProtectionTemp); });
+        Hit(sw, _onProtectionToggle);
 
-        using var font = Theme.Font(12);
-        using var muted = new SolidBrush(Theme.Muted);
-        using var text = new SolidBrush(Theme.Text);
         g.DrawString("İşlemci ya da ekran kartı bu sıcaklığa ulaşırsa fanlar tam hıza çıkar, soğuyunca eski haline döner.",
-            font, muted, new RectangleF(r.X + 16, r.Y + 44, r.Width - 32, 54));
+            Font12, MutedBrush, new RectangleF(r.X + 16, r.Y + 44, r.Width - 32, 54));
 
         // Eşik ayarı
         float sy = r.Y + 106;
-        Button(g, new RectangleF(r.X + 16, sy, 44, 38), "−", false, () => ChangeProtectionTemp(-1), fontSize: 18);
-        Button(g, new RectangleF(r.Right - 16 - 44, sy, 44, 38), "+", false, () => ChangeProtectionTemp(+1), fontSize: 18);
-        using var big = Theme.Number(26);
-        var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-        using var valueBrush = new SolidBrush(ProtectionEnabled ? Theme.Text : Theme.Muted);
-        g.DrawString($"{ProtectionTemp}°C", big, valueBrush, new RectangleF(r.X + 60, sy, r.Width - 120, 38), fmt);
+        Button(g, new RectangleF(r.X + 16, sy, 44, 38), "−", false, _onProtectionDown, fontSize: 18);
+        Button(g, new RectangleF(r.Right - 16 - 44, sy, 44, 38), "+", false, _onProtectionUp, fontSize: 18);
+        if (_protTextValue != ProtectionTemp)
+        {
+            _protTextValue = ProtectionTemp;
+            _protText = $"{ProtectionTemp}°C";
+        }
+        g.DrawString(_protText, Number26, ProtectionEnabled ? TextBrush : MutedBrush, new RectangleF(r.X + 60, sy, r.Width - 120, 38), CenterBothFormat);
 
-        using var sep = new Pen(Theme.CardBorder);
-        g.DrawLine(sep, r.X + 16, r.Y + 166, r.Right - 16, r.Y + 166);
+        g.DrawLine(SeparatorPen, r.X + 16, r.Y + 166, r.Right - 16, r.Y + 166);
 
         // Hazır ayarlar
         DrawLabel(g, "Hazır ayarlar", r.X + 16, r.Y + 182);
@@ -445,14 +510,13 @@ public sealed class FanView : PanelView
             var preset = Presets[i];
             var rect = new RectangleF(r.X + 16 + (i % 2) * (bw + 8), by + (i / 2) * 44, bw, 36);
             bool selected = _cpu!.SameAs(preset.cpu) && _gpu!.SameAs(preset.gpu);
-            Button(g, rect, preset.name, selected, () => LoadCurves(preset.cpu, preset.gpu), activeColor: Color.FromArgb(70, 70, 82));
+            Button(g, rect, preset.name, selected, _onPreset[i], activeColor: Color.FromArgb(70, 70, 82));
         }
         bool factory = _cpu!.SameAs(fan.FactoryCpu) && _gpu!.SameAs(fan.FactoryGpu);
-        Button(g, new RectangleF(r.X + 16 + bw + 8, by + 44, bw, 36), "Fabrika", factory,
-            () => { if (fan.FactoryCpu != null && fan.FactoryGpu != null) LoadCurves(fan.FactoryCpu, fan.FactoryGpu); },
+        Button(g, new RectangleF(r.X + 16 + bw + 8, by + 44, bw, 36), "Fabrika", factory, _onFactory,
             activeColor: Color.FromArgb(70, 70, 82));
 
-        g.DrawString("Bir ayar seçtikten sonra “Uygula”ya basın.", font, muted,
+        g.DrawString("Bir ayar seçtikten sonra “Uygula”ya basın.", Font12, MutedBrush,
             new RectangleF(r.X + 16, by + 92, r.Width - 32, 36));
     }
 
@@ -475,16 +539,17 @@ public sealed class FanView : PanelView
     private void DrawFooter(Graphics g, FanState fan)
     {
         string message = _dirty ? "Uygulanmamış değişiklikler var." : _localMessage.Length > 0 ? _localMessage : fan.Message;
-        using var font = Theme.Font(13);
-        using var brush = new SolidBrush(_dirty ? Color.FromArgb(240, 220, 90) : Theme.Muted);
-        g.DrawString(message, font, brush, new RectangleF(22, 542, 540, 22));
-        using var tiny = Theme.Font(11);
-        using var muted = new SolidBrush(Color.FromArgb(100, 100, 110));
-        g.DrawString($"EC bellenimi: {fan.Firmware}", tiny, muted, 22, 564);
+        g.DrawString(message, Font13, _dirty ? YellowBrush : MutedBrush, new RectangleF(22, 542, 540, 22));
+        if (!ReferenceEquals(_firmwareSource, fan.Firmware))
+        {
+            _firmwareSource = fan.Firmware;
+            _firmwareText = $"EC bellenimi: {fan.Firmware}";
+        }
+        g.DrawString(_firmwareText, Font11, DimBrush, 22, 564);
 
-        Button(g, new RectangleF(592, 532, 100, 40), "Geri al", false, Revert, enabled: _dirty);
+        Button(g, new RectangleF(592, 532, 100, 40), "Geri al", false, _onRevert, enabled: _dirty);
         // Sabit devir ekranında eğri görünmediği için "Uygula" yalnızca bekleyen eğri değişikliği varsa çalışır
-        Button(g, new RectangleF(700, 532, 140, 40), "Uygula", _dirty, Apply, enabled: _dirty || !FixedView);
+        Button(g, new RectangleF(700, 532, 140, 40), "Uygula", _dirty, _onApply, enabled: _dirty || !FixedView);
     }
 
     private void Apply()
@@ -499,7 +564,14 @@ public sealed class FanView : PanelView
         _localMessage = "Uygulanıyor…";
         _dirty = false;
         _loadedRevision = -1; // EC'den geri okunan eğriyi yükle
+        int before = PendingSeq;
         ApplyRequested?.Invoke(_cpu.Copy(), _gpu.Copy());
+        // Olay işleyicisi komutu kuyruğa koyduysa sıra numarası arttı; o işlenene kadar eski eğri yüklenmez
+        if (PendingSeq != before)
+        {
+            _applySeq = PendingSeq;
+            _applyAt = DateTime.UtcNow;
+        }
     }
 
     private void Revert()
@@ -566,9 +638,13 @@ public sealed class FanView : PanelView
     {
         var p = ToLogical(e.Location);
         int hover = _drag >= 0 ? _drag : HandleAt(p);
-        if (hover != _hoverHandle) { _hoverHandle = hover; Invalidate(); }
         int sliderHover = _sliderDrag >= 0 ? _sliderDrag : SliderAt(p);
-        if (sliderHover != _sliderHover) { _sliderHover = sliderHover; Invalidate(); }
+        if (hover != _hoverHandle || sliderHover != _sliderHover)
+        {
+            _hoverHandle = hover;
+            _sliderHover = sliderHover;
+            Invalidate();
+        }
         base.OnMouseMove(e);
         if (HandlesCursor) Cursor = _sliderHover >= 0 ? Cursors.Hand : Cursors.SizeAll;
 
@@ -580,7 +656,14 @@ public sealed class FanView : PanelView
         }
 
         if (_drag < 0) return;
-        var curve = Editing!;
+        var curve = Editing;
+        if (curve == null) { _drag = -1; return; }
+
+        // Eğri gerçekten değişmediyse (fare aynı değer içinde kıpırdadı) yeniden çizim ve karşılaştırma yapılmaz
+        Span<int> before = stackalloc int[13];
+        curve.Temps.AsSpan().CopyTo(before);
+        curve.Speeds.AsSpan().CopyTo(before[6..]);
+
         int speed = (int)Math.Round((Plot.Bottom - p.Y) / Plot.Height * AxisSpeedMax);
         SetSpeed(curve, _drag, speed);
         if (_drag > 0)
@@ -588,6 +671,7 @@ public sealed class FanView : PanelView
             int temp = (int)Math.Round(AxisTempMin + (p.X - Plot.X) / Plot.Width * (AxisTempMax - AxisTempMin));
             SetTemp(curve, _drag - 1, temp);
         }
+        if (curve.Temps.AsSpan().SequenceEqual(before[..6]) && curve.Speeds.AsSpan().SequenceEqual(before[6..])) return;
         UpdateDirty();
         Invalidate();
     }
@@ -595,14 +679,42 @@ public sealed class FanView : PanelView
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if (EndDrag()) Capture = false;
+    }
+
+    /// <summary>Fare yakalaması kaybolursa (pencere değişimi, açılan iletişim kutusu) sürükleme yarıda kalmasın.</summary>
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        base.OnMouseCaptureChanged(e);
+        if (!Capture) EndDrag();
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        // Fare sayfadan çıkınca tutamak ve çubuk vurgusu kalmasın (sürükleme sürerken korunur)
+        int hover = _drag >= 0 ? _drag : -1, sliderHover = _sliderDrag >= 0 ? _sliderDrag : -1;
+        if (hover != _hoverHandle || sliderHover != _sliderHover)
+        {
+            _hoverHandle = hover;
+            _sliderHover = sliderHover;
+            Invalidate();
+        }
+    }
+
+    /// <summary>Süren sürüklemeyi bitirir; çubuk bırakıldıysa yeni devir uygulanır. Sürükleme varsa true döner.</summary>
+    private bool EndDrag()
+    {
+        bool any = false;
         if (_sliderDrag >= 0)
         {
             _sliderDrag = -1;
-            Capture = false;
             RequestFixed(); // bırakınca uygulanır
-            Invalidate();
+            any = true;
         }
-        if (_drag >= 0) { _drag = -1; Capture = false; Invalidate(); }
+        if (_drag >= 0) { _drag = -1; any = true; }
+        if (any) Invalidate();
+        return any;
     }
 
     /// <summary>Hızı ayarlar; eğri azalmayan kalsın diye komşu kademeleri de iter.</summary>
