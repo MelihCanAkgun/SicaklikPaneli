@@ -7,6 +7,9 @@ public readonly record struct OcClock(bool Editable, int OffsetMhz, int MinMhz, 
 
 public sealed record OcState(bool Available, string Message, OcClock Core, OcClock Memory)
 {
+    /// <summary>Ekran kartı uykuda (Optimus): bilgi şu an okunamıyor, kart uyanınca okunabilir.</summary>
+    public bool Asleep { get; init; }
+
     public static OcState Unavailable(string message) => new(false, message, default, default);
 }
 
@@ -32,7 +35,7 @@ public static unsafe class GpuOverclock
     private const int NvApiNotInitialized = -4, NvInvalidHandle = -8, NvHandleInvalidated = -10, NvGpuNotPowered = -220;
 
     // Sık dönen durumlar her okumada yeniden oluşturulmasın
-    private static readonly OcState Sleeping = OcState.Unavailable("Ekran kartı şu an uykuda. Bir oyun açıkken bu sayfaya tekrar bak.");
+    private static readonly OcState Sleeping = OcState.Unavailable("Ekran kartı şu an uykuda. Bir oyun açıkken bu sayfaya tekrar bak.") with { Asleep = true };
     private static readonly OcState NotSupported = OcState.Unavailable("Ekran kartı hız aşırtmayı desteklemiyor.");
 
     private static readonly object Sync = new();
@@ -166,15 +169,23 @@ public static unsafe class GpuOverclock
     }
 
     /// <summary>Çekirdek ve bellek saat ofsetlerini (MHz) ayarlar. Sürücünün aralığı dışına çıkmaz.</summary>
-    public static bool Apply(int coreMhz, int memoryMhz, out string error)
+    public static bool Apply(int coreMhz, int memoryMhz, out string error) =>
+        Apply(coreMhz, memoryMhz, out error, out _);
+
+    /// <summary>
+    /// <see cref="Apply(int, int, out string)"/> ile aynı; ayrıca ekran kartı uykuda olduğu için
+    /// uygulanamadıysa <paramref name="asleep"/> true olur (kart uyandırılmaz, hiçbir şey yazılmaz).
+    /// </summary>
+    public static bool Apply(int coreMhz, int memoryMhz, out string error, out bool asleep)
     {
         lock (Sync)
         {
             error = "";
+            asleep = false;
             OcState state;
             try { state = ReadLocked(); }
             catch (Exception ex) { error = ex.Message; return false; }
-            if (!state.Available) { error = state.Message; return false; }
+            if (!state.Available) { error = state.Message; asleep = state.Asleep; return false; }
 
             bool ok = true;
             if (state.Core.Editable)

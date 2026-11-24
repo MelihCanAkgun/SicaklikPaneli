@@ -117,6 +117,7 @@ dotnet run --project tools\IconGen -- DragonSaj.ico
 |---|---|
 | `%AppData%\SicaklikPaneli\ayarlar.json` | Panel modu, konum, saydamlık, fan / performans / hız aşırtma ayarları |
 | `%AppData%\SicaklikPaneli\fan_fabrika.json` | İlk çalıştırmada EC'den yedeklenen özgün fan eğrisi |
+| `%AppData%\SicaklikPaneli\hatalar.log` | Beklenmeyen hataların günlüğü (sorun bildirirken işe yarar) |
 
 Programı tamamen kaldırmak için: *Windows ile başlat* seçeneğini kapatın (ya da `schtasks /delete /tn DragonSaj /f`), program klasörünü ve `%AppData%\SicaklikPaneli` klasörünü silin.
 

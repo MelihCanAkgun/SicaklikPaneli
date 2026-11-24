@@ -722,8 +722,25 @@ public sealed class FanView : PanelView
             any = true;
         }
         if (_drag >= 0) { _drag = -1; any = true; }
-        if (any) Invalidate();
+        if (any)
+        {
+            // Vurgu takılı kalmasın; fare hâlâ tutamağın üzerindeyse bir sonraki hareket vurguyu geri getirir
+            _hoverHandle = -1;
+            _sliderHover = -1;
+            Invalidate();
+        }
         return any;
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        // Sayfa yeniden açıldığında ilk karede eski vurgu görünmesin
+        if (!Visible && _drag < 0 && _sliderDrag < 0)
+        {
+            _hoverHandle = -1;
+            _sliderHover = -1;
+        }
     }
 
     /// <summary>Hızı ayarlar; eğri azalmayan kalsın diye komşu kademeleri de iter.</summary>

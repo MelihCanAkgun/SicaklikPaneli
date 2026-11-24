@@ -69,7 +69,8 @@ public sealed class Sensors : IDisposable
             RamUsed = ramUsed,
             RamTotal = ramTotal,
             CpuThrottle = _throttle.CpuThrottling(cpuTemp),
-            GpuThrottle = _throttle.GpuThrottling()
+            // Sıcaklık ve yük ikisi de yoksa ekran kartı uykudadır: NVML sorgulanıp kart uyandırılmasın
+            GpuThrottle = _throttle.GpuThrottling(gpuAwake: gpuTemp.HasValue || gpuLoad.HasValue)
         };
     }
 

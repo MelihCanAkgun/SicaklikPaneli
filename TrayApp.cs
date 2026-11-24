@@ -32,8 +32,18 @@ public sealed class TrayApp : ApplicationContext
     private bool _warnedNoCpuTemp;
     private volatile bool _closing;
     private Task? _sensorTask, _fanTask;
-    private readonly SessionEndingEventHandler _onSessionEnding;
+    private readonly SessionEndedEventHandler _onSessionEnded;
+    private int _backgroundStopped; // 1: arka plan temizliği (döngüler, OC, RTSS) yapıldı
+    private bool _exited;
     private int _readCount;
+    // Ekran kartı uykudayken uygulanamayan hız aşırtma ayarı; kart uyanınca uygulanır
+    private bool _ocAwaitWake;
+    private bool _perfWasVisible;
+    // Güç planı çağrıları sırayla ve en son istenen modla yapılır (hızlı tıklamada ters sırada bitmesin)
+    private readonly object _planLock = new();
+    private volatile PerfMode _wantedPlan;
+    // Fan verisini gösteren bir pencere açık mı? Fan iş parçacığı bunu FanController.UiVisible'a aktarır
+    private volatile bool _fanUiVisible = true;
     private volatile bool _rtssActive;
     private readonly bool _rtssInstalled = RtssOsd.FindExe() != null;
 
@@ -44,6 +54,10 @@ public sealed class TrayApp : ApplicationContext
     private int _commandSeq;
     private volatile FanState _fanState = FanState.Unavailable("Fan bilgisi bekleniyor…");
     private volatile Snapshot _lastSensors = Snapshot.Empty;
+    // Son başarılı sensör okumasının zamanı (Environment.TickCount64); Volatile ile okunup yazılır
+    private long _lastSensorsAt;
+    /// <summary>Bundan eski sensör verisiyle fan koruması karar vermez (okuma takıldıysa ya da hata veriyorsa).</summary>
+    private const long SensorStaleMs = 5000;
     private DateTime _lastHistory = DateTime.MinValue;
 
     private ToolStripMenuItem _modeAuto = null!, _modeAlways = null!, _modeOff = null!, _autostart = null!,
@@ -53,7 +67,7 @@ public sealed class TrayApp : ApplicationContext
     public TrayApp()
     {
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
-        _onSessionEnding = (_, _) => ResetOcOnExit();
+        _onSessionEnded = (_, _) => StopBackground();
         MigrateAutostart();
 
         _overlay = new OverlayForm { Opacity = Math.Clamp(_settings.Opacity, 20, 99) / 100.0 };
@@ -80,7 +94,11 @@ public sealed class TrayApp : ApplicationContext
 
         // Panelin görünürlüğünü saniyede 2 kez kontrol et
         _uiTimer = new System.Windows.Forms.Timer { Interval = 500 };
-        _uiTimer.Tick += (_, _) => UpdateOverlayVisibility();
+        _uiTimer.Tick += (_, _) =>
+        {
+            UpdateOverlayVisibility();
+            UpdateFanUiVisible();
+        };
         _uiTimer.Start();
 
         // Ömür boyu süren döngüler iş parçacığı havuzunu meşgul etmesin: ayrı (arka plan) iş parçacıkları
@@ -161,16 +179,35 @@ public sealed class TrayApp : ApplicationContext
                 perf.Message = "Önceki oturum düzgün kapanmadığı için hız aşırtma güvenlik amacıyla kapatıldı.";
             }
         }
-        SystemEvents.SessionEnding += _onSessionEnding;
+        // Oturum gerçekten kapanınca (iptal edilmediyse) temizlik yapılır; bu durumda ExitThreadCore çağrılmayabilir
+        SystemEvents.SessionEnded += _onSessionEnded;
     }
 
     private void ApplyOc(bool enabled, int core, int memory)
     {
+        if (_closing) return; // kapanışta sıfırlanan ofset yeniden uygulanmasın
         var perf = _dashboard.Perf;
         core = Math.Clamp(core, 0, PerfView.CoreLimit);
         memory = Math.Clamp(memory, 0, PerfView.MemoryLimit);
 
-        bool ok = GpuOverclock.Apply(enabled ? core : 0, enabled ? memory : 0, out string error);
+        bool ok = GpuOverclock.Apply(enabled ? core : 0, enabled ? memory : 0, out string error, out bool asleep);
+        if (!ok && asleep)
+        {
+            // Ekran kartı uykuda (Optimus): tercihi kaybetme, kart uyanınca uygulanacak (bkz. CheckOcAfterWake).
+            // Henüz bir şey yazılmadığı için "temiz kapanış" bayrağına dokunulmaz.
+            _ocAwaitWake = true;
+            _settings.GpuOcEnabled = enabled;
+            _settings.GpuOcCore = core;
+            _settings.GpuOcMemory = memory;
+            _settings.Save();
+            perf.Oc = GpuOverclock.Read();
+            perf.OcEnabled = enabled;
+            perf.Message = enabled ? "Ekran kartı uykuda; hız aşırtma kart uyandığında uygulanacak."
+                                   : "Hız aşırtma kapatıldı.";
+            perf.Invalidate();
+            return;
+        }
+        _ocAwaitWake = false;
         bool active = ok && enabled;
 
         _settings.GpuOcEnabled = active;
@@ -190,12 +227,41 @@ public sealed class TrayApp : ApplicationContext
     /// <summary>Program ya da Windows kapanırken ofsetleri sıfırlar ve oturumu "temiz" olarak işaretler.</summary>
     private void ResetOcOnExit()
     {
-        if (_settings.GpuOcEnabled) GpuOverclock.Apply(0, 0, out _);
-        if (!_settings.GpuOcCleanExit)
+        bool reset = true;
+        if (_settings.GpuOcEnabled || _ocAwaitWake)
+        {
+            // Kart uykudaysa yazılamaz ama ofset de etkin değildir; kapanış yine temiz sayılır.
+            // Başka bir hatayla sıfırlanamadıysa oturum temiz sayılmaz: sonraki açılışta yeniden uygulanmaz.
+            reset = GpuOverclock.Apply(0, 0, out string error, out bool asleep) || asleep;
+            if (!reset) HataGunlugu.Write("Kapanışta hız aşırtma sıfırlanamadı: " + error);
+        }
+        if (reset && !_settings.GpuOcCleanExit)
         {
             _settings.GpuOcCleanExit = true;
             _settings.Save();
         }
+    }
+
+    /// <summary>
+    /// Kart uykudayken bekletilen hız aşırtma ayarı: periyodik okuma kartın uyandığını ve ofsetin
+    /// istenenden farklı olduğunu gösterirse ayar bir kez uygulanır. Kartı uyandırmak için çağrı yapılmaz.
+    /// </summary>
+    private OcState? CheckOcAfterWake(OcState? oc)
+    {
+        if (oc == null || !_ocAwaitWake) return oc;
+        if (oc.Asleep || !oc.Available) return oc;
+
+        bool on = _settings.GpuOcEnabled;
+        int core = on ? Math.Clamp(_settings.GpuOcCore, 0, PerfView.CoreLimit) : 0;
+        int memory = on ? Math.Clamp(_settings.GpuOcMemory, 0, PerfView.MemoryLimit) : 0;
+        // Sürücü aralığına sığdırılmış hedefle karşılaştır (aksi halde her okumada yeniden uygulanırdı)
+        static bool Same(OcClock c, int target) =>
+            !c.Editable || c.OffsetMhz == Math.Clamp(target, Math.Min(0, c.MinMhz), Math.Max(0, c.MaxMhz));
+
+        _ocAwaitWake = false;
+        if (Same(oc.Core, core) && Same(oc.Memory, memory)) return oc;
+        ApplyOc(on, _settings.GpuOcCore, _settings.GpuOcMemory); // perf.Oc'yi de günceller
+        return null;
     }
 
     /// <summary>Performans modu: EC'deki MSI Shift modu + uygun Windows güç planı.</summary>
@@ -204,7 +270,13 @@ public sealed class TrayApp : ApplicationContext
         _settings.PerfStartup = mode;
         _settings.Save();
         FanCommand(f => f.SetPerfMode(mode));
-        Task.Run(() => PowerPlan.Apply(mode));
+        // Çağrılar kilitle sıralanır ve her biri o an istenen son modu uygular: hızlı Turbo→Dengeli
+        // tıklamasında görevler ters sırada çalışsa bile en son seçilen plan etkin kalır.
+        _wantedPlan = mode;
+        Task.Run(() =>
+        {
+            lock (_planLock) PowerPlan.Apply(_wantedPlan);
+        });
     }
 
     /// <summary>Komutu fan iş parçacığına gönderir. Fan sayfası, bu sıra numarası işlenene kadar seçimi "bekliyor" gösterir.</summary>
@@ -290,7 +362,10 @@ public sealed class TrayApp : ApplicationContext
         try
         {
             fan = new FanController();
-            if (fan.State.Available) ApplySavedFanSettings(fan);
+            fan.UiVisible = _fanUiVisible;
+            // Kayıtlı ayar, EC bağlantısı her kurulduğunda uygulanır: ilk açılışta, açılışta EC kullanılamayıp
+            // sonradan açıldığında ve hata sonrası yeniden bağlanınca (aynı modu yeniden yazmak zararsızdır).
+            int appliedGen = 0;
             int done = 0;
             _fanState = fan.State;
 
@@ -301,6 +376,14 @@ public sealed class TrayApp : ApplicationContext
                 // Tek bir turdaki beklenmeyen hata döngüyü (ve fan denetimini) öldürmesin
                 try
                 {
+                    fan.UiVisible = _fanUiVisible;
+                    // Önceki turun Tick'i bağlantıyı yeniden kurduysa, bekleyen komutlardan önce kayıtlı ayarı uygula
+                    if (fan.State.Available && fan.InitGeneration != appliedGen)
+                    {
+                        appliedGen = fan.InitGeneration;
+                        ApplySavedFanSettings(fan);
+                    }
+
                     bool ran = false;
                     while (_fanCommands.TryDequeue(out var command))
                     {
@@ -310,8 +393,12 @@ public sealed class TrayApp : ApplicationContext
                         ran = true;
                     }
 
+                    // Sensör verisi bayatsa (okuma takıldı ya da art arda hata veriyor) sıcaklık bilinmiyor sayılır;
+                    // FanController bu durumda koruma kararını değiştirmez
                     var sensors = _lastSensors;
-                    fan.Tick(sensors.CpuTemp, sensors.GpuTemp, _settings.FanProtection, _settings.FanProtectionTemp);
+                    bool fresh = Environment.TickCount64 - Volatile.Read(ref _lastSensorsAt) <= SensorStaleMs;
+                    fan.Tick(fresh ? sensors.CpuTemp : null, fresh ? sensors.GpuTemp : null,
+                             _settings.FanProtection, _settings.FanProtectionTemp);
                     _fanState = fan.State with { CommandSeq = done };
 
                     // Komut sonucu sensör döngüsünü beklemeden arayüze gitsin
@@ -333,34 +420,75 @@ public sealed class TrayApp : ApplicationContext
         catch (Exception ex)
         {
             HataGunlugu.Write("Fan döngüsü durdu", ex);
+            // Arayüz eski "kullanılabilir" durumu göstermeye devam etmesin
+            _fanState = FanState.Unavailable("Fan denetimi durdu: " + ex.Message);
         }
         finally
         {
-            fan?.Dispose();
+            try { fan?.Dispose(); }
+            catch (Exception ex) { HataGunlugu.Write("Fan denetimi kapatılamadı", ex); }
         }
     }
 
     private void SensorLoop(CancellationToken ct)
     {
+        const int ReadFailureLimit = 10;          // bu kadar ardışık okuma hatasından sonra sensörler yeniden açılır
+        const long ReopenMinMs = 5000, ReopenMaxMs = 120000;
         Sensors? sensors = null;
         try
         {
-            sensors = new Sensors();
-
-            int tick = 0;
-            bool readFailed = false, loopFailed = false;
+            int tick = 0, readFailures = 0;
+            bool loopFailed = false, openReported = false;
+            long nextOpen = 0, reopenDelay = ReopenMinMs;
             while (!ct.IsCancellationRequested)
             {
                 // Tek bir turdaki beklenmeyen hata (ör. RTSS) sensör döngüsünü öldürmesin
                 try
                 {
-                    Snapshot snap;
-                    try { snap = sensors.Read(); readFailed = false; }
-                    catch (Exception ex)
+                    // Sensörler açılamadıysa ya da kapatıldıysa artan aralıkla yeniden açmayı dene
+                    if (sensors == null && Environment.TickCount64 >= nextOpen)
                     {
-                        if (!readFailed) HataGunlugu.Write("Sensör okuma", ex);
-                        readFailed = true;
-                        snap = Snapshot.Empty;
+                        try
+                        {
+                            sensors = new Sensors();
+                            reopenDelay = ReopenMinMs;
+                        }
+                        catch (Exception ex)
+                        {
+                            nextOpen = Environment.TickCount64 + reopenDelay;
+                            reopenDelay = Math.Min(reopenDelay * 2, ReopenMaxMs);
+                            if (!openReported)
+                            {
+                                openReported = true;
+                                HataGunlugu.Write("Sensörler açılamadı", ex);
+                                PostUi(() => MessageBox.Show("Sensörler açılamadı:\n" + ex.Message, "Dragon Saj",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Error));
+                            }
+                        }
+                    }
+
+                    Snapshot snap = Snapshot.Empty;
+                    if (sensors != null)
+                    {
+                        try
+                        {
+                            snap = sensors.Read();
+                            readFailures = 0;
+                            Volatile.Write(ref _lastSensorsAt, Environment.TickCount64);
+                        }
+                        catch (Exception ex)
+                        {
+                            if (readFailures == 0) HataGunlugu.Write("Sensör okuma", ex);
+                            if (++readFailures >= ReadFailureLimit)
+                            {
+                                // Sürekli hata: sensörleri kapatıp yeniden aç (ör. sürücü yeniden yüklendi)
+                                HataGunlugu.Write($"Sensör okuma {ReadFailureLimit} kez art arda başarısız; sensörler yeniden açılıyor.");
+                                try { sensors.Dispose(); } catch { }
+                                sensors = null;
+                                readFailures = 0;
+                                nextOpen = Environment.TickCount64;
+                            }
+                        }
                     }
 
                     _lastSensors = snap;
@@ -393,13 +521,11 @@ public sealed class TrayApp : ApplicationContext
         }
         catch (Exception ex)
         {
-            HataGunlugu.Write("Sensörler açılamadı", ex);
-            PostUi(() => MessageBox.Show("Sensörler açılamadı:\n" + ex.Message, "Dragon Saj",
-                MessageBoxButtons.OK, MessageBoxIcon.Error));
+            HataGunlugu.Write("Sensör döngüsü durdu", ex);
         }
         finally
         {
-            sensors?.Dispose();
+            try { sensors?.Dispose(); } catch { }
         }
     }
 
@@ -410,8 +536,8 @@ public sealed class TrayApp : ApplicationContext
         UpdatePerfMenu(s);
         _dashboard.Fans.SetData(s);
         if (_dashboard.IsPageVisible(_dashboard.Fans)) _dashboard.Fans.Invalidate();
-        _dashboard.Perf.Data = s;
-        if (_dashboard.IsPageVisible(_dashboard.Perf)) _dashboard.Perf.Invalidate();
+        if (_dashboard.IsPageVisible(_dashboard.Perf)) _dashboard.Perf.UpdateData(s); // yalnızca değişiklikte çizer
+        else _dashboard.Perf.Data = s;
     }
 
     private void UpdatePerfMenu(Snapshot s)
@@ -446,11 +572,26 @@ public sealed class TrayApp : ApplicationContext
         if (_dashboard.IsPageVisible(_dashboard.Fans)) _dashboard.Fans.Invalidate();
 
         var perf = _dashboard.Perf;
-        perf.Data = s;
-        if (_dashboard.IsPageVisible(perf))
+        bool perfVisible = _dashboard.IsPageVisible(perf);
+        // Hız aşırtma durumu 10 saniyede bir okunur (sürücü ofseti sıfırlamış olabilir): sayfa görünürken ya da
+        // uykudaki kart için bekletilen ayar varken. İkincisinde yalnızca sensörler kartın uyanık olduğunu gösteriyorsa.
+        OcState? oc = null;
+        // Sayfa yeniden görünür olduğunda (sekme değişimi, pencere açılması) da bir kez okunur: gizliyken yenilenmemişti.
+        // Okuma kartı uyandırmaz; kart uykudaysa yalnızca "uykuda" döner.
+        bool perfShown = perfVisible && !_perfWasVisible;
+        _perfWasVisible = perfVisible;
+        if (perfShown || (_readCount % 10 == 0 &&
+            (perfVisible || (_ocAwaitWake && (s.GpuTemp.HasValue || s.GpuLoad.HasValue)))))
         {
-            if (_readCount % 10 == 0) perf.Oc = GpuOverclock.Read(); // sürücü ofseti sıfırlamış olabilir
-            perf.Invalidate();
+            oc = GpuOverclock.Read();
+            if (oc.Asleep && _settings.GpuOcEnabled) _ocAwaitWake = true; // uyanınca ofset denetlenecek
+            oc = CheckOcAfterWake(oc);
+        }
+        if (perfVisible) perf.UpdateData(s, oc); // yalnızca görünen bir şey değişince yeniden çizer
+        else
+        {
+            perf.Data = s; // gizliyken çizim yok; sayfa açılınca bu veriyle çizilir
+            if (oc != null) perf.Oc = oc;
         }
 
         static string Fmt(float? t, float? l, bool throttle) =>
@@ -547,6 +688,19 @@ public sealed class TrayApp : ApplicationContext
         {
             _overlay.Hide();
         }
+    }
+
+    /// <summary>
+    /// Fan devri ve yüzdesi yalnızca ana pencerede (Gösterge ve Fan sayfaları) görünür; oyun paneli, RTSS ve
+    /// tepsi ipucu göstermez. Pencere kapalı ya da simge durumundayken fan iş parçacığı salt görüntü amaçlı
+    /// EC okumalarını seyreltir (koruma ve sabit devir etkilenmez).
+    /// </summary>
+    private void UpdateFanUiVisible()
+    {
+        bool visible = _dashboard.Visible && _dashboard.WindowState != FormWindowState.Minimized;
+        if (visible == _fanUiVisible) return;
+        _fanUiVisible = visible;
+        if (visible) _wake.Set(); // pencere açılınca güncel fan durumu hemen okunsun
     }
 
     private void CycleMode()
@@ -701,15 +855,21 @@ public sealed class TrayApp : ApplicationContext
 
     // ---------------- Kapanış ----------------
 
-    protected override void ExitThreadCore()
+    /// <summary>
+    /// Donanımla ilgili temizlik: hız aşırtmayı sıfırlar, döngüleri durdurup bekler (fan denetleyicisi kendi
+    /// iş parçacığında kapanır ve korumanın açtığı tam hızı bırakır), RTSS girdisini kaldırır.
+    /// Hem program kapanışında hem Windows oturumu biterken (ExitThreadCore çağrılmayabilir) bir kez çalışır.
+    /// Arayüz nesnelerine dokunmaz.
+    /// </summary>
+    private void StopBackground()
     {
-        if (_closing) return; // ikinci çağrı (ör. Windows kapanırken): her şey zaten bırakıldı
+        if (Interlocked.Exchange(ref _backgroundStopped, 1) != 0) return;
         _closing = true; // bundan sonra arka plandan gelen arayüz işleri yapılmaz
 
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
-        SystemEvents.SessionEnding -= _onSessionEnding;
-        _uiTimer.Stop();
-        ResetOcOnExit();
+        SystemEvents.SessionEnded -= _onSessionEnded;
+        try { ResetOcOnExit(); }
+        catch (Exception ex) { HataGunlugu.Write("Kapanışta hız aşırtma", ex); }
 
         // Döngülerin bitmesini kısa süre bekle: fan denetleyicisi (korumanın açtığı tam hızı bırakır)
         // ve sensörler süreç bitmeden düzgün kapansın, RTSS girdisi de silindikten sonra yeniden yazılmasın.
@@ -722,7 +882,18 @@ public sealed class TrayApp : ApplicationContext
         }
         catch (Exception ex) { HataGunlugu.Write("Kapanış", ex); }
 
-        RtssOsd.Release();
+        // Girdiyi siler ve sonradan gelebilecek güncellemeleri yok sayar (döngü zamanında bitmediyse bile)
+        RtssOsd.Shutdown();
+    }
+
+    protected override void ExitThreadCore()
+    {
+        if (_exited) return; // ikinci çağrı (ör. Windows kapanırken): her şey zaten bırakıldı
+        _exited = true;
+
+        _uiTimer.Stop();
+        StopBackground();
+
         Native.UnregisterHotKey(_hotkeys.Handle, HotkeyId);
         _hotkeys.DestroyHandle();
         _uiTimer.Dispose();

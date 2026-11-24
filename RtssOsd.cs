@@ -36,6 +36,9 @@ public static class RtssOsd
     private static long _capacity;
     private static int _uses;
     private static bool _shutdown;
+    // RTSS çalışmıyorken her saniye açmayı deneyip istisna üretmemek için bekleme süresi
+    private const long RetryOpenMs = 3000;
+    private static long _nextOpenTry;
 
     /// <summary>Yazıyı RTSS'e gönderir. RTSS çalışmıyorsa false döner.</summary>
     public static bool Update(string text)
@@ -78,6 +81,10 @@ public static class RtssOsd
             if (++_uses < ReopenEvery) return true;
             CloseView();
         }
+        else if (Environment.TickCount64 < _nextOpenTry)
+        {
+            return false; // az önce açılamadı (RTSS çalışmıyor); birkaç saniye sonra yeniden denenir
+        }
 
         MemoryMappedFile? mmf = null;
         MemoryMappedViewAccessor? view = null;
@@ -98,6 +105,7 @@ public static class RtssOsd
         {
             view?.Dispose();
             mmf?.Dispose();
+            _nextOpenTry = Environment.TickCount64 + RetryOpenMs;
             return false; // RTSS çalışmıyor
         }
     }
