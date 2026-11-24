@@ -48,20 +48,46 @@ internal static class HataGunlugu
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SicaklikPaneli");
     private static readonly string FilePath = Path.Combine(Dir, "hatalar.log");
 
-    public static void Write(string context, Exception? ex) =>
-        Write(ex == null ? context : $"{context}: {ex}");
+    /// <summary>Aynı ileti bu süre içinde yeniden gelirse yazılmaz, yalnızca sayılır.</summary>
+    private const long RepeatWindowMs = 60000;
+    private static string? _lastKey;
+    private static long _lastAt;
+    private static int _suppressed;
 
-    public static void Write(string message)
+    public static void Write(string context, Exception? ex)
+    {
+        if (ex == null) { WriteCore(context, context, null); return; }
+        // Aynı hata: bağlam + tür + ileti + yığının ilk satırı (tam yığın izi her seferinde yazılmasın)
+        string? stack = ex.StackTrace;
+        int nl = stack?.IndexOf('\n') ?? -1;
+        string first = stack == null ? "" : (nl >= 0 ? stack[..nl] : stack).Trim();
+        WriteCore($"{context}|{ex.GetType().FullName}|{ex.Message}|{first}", context, ex);
+    }
+
+    public static void Write(string message) => WriteCore(message, message, null);
+
+    private static void WriteCore(string key, string context, Exception? ex)
     {
         try
         {
             lock (Gate)
             {
+                long now = Environment.TickCount64;
+                if (key == _lastKey && now - _lastAt < RepeatWindowMs) { _suppressed++; return; }
+
+                string time = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ";
+                string text = time + (ex == null ? context : $"{context}: {ex}") + Environment.NewLine;
+                if (_suppressed > 0)
+                    text = $"{time}(önceki ileti {_suppressed} kez daha tekrarlandı){Environment.NewLine}" + text;
+                _lastKey = key;
+                _lastAt = now;
+                _suppressed = 0;
+
                 Directory.CreateDirectory(Dir);
                 var info = new FileInfo(FilePath);
                 if (info.Exists && info.Length > MaxBytes)
                     File.Move(FilePath, FilePath + ".old", overwrite: true);
-                File.AppendAllText(FilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
+                File.AppendAllText(FilePath, text);
             }
         }
         catch { }

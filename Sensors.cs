@@ -38,7 +38,13 @@ public sealed class Sensors : IDisposable
         _pc = new Computer { IsCpuEnabled = true, IsGpuEnabled = true };
         _pc.HardwareAdded += OnHardwareChanged;
         _pc.HardwareRemoved += OnHardwareChanged;
-        _pc.Open();
+        // Yarıda kalan açılış kapatılmazsa her yeniden denemede sürücü/muteks tanıtıcıları sızar
+        try { _pc.Open(); }
+        catch
+        {
+            try { _pc.Close(); } catch { }
+            throw;
+        }
     }
 
     public Snapshot Read()

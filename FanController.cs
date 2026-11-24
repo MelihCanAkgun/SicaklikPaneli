@@ -51,6 +51,9 @@ public sealed class FanController : IDisposable
     private const int WaitFailureLimit = 20;
     private static readonly FieldInfo? WaitFailuresField =
         typeof(WindowsEmbeddedControllerIO).GetField("_waitReadFailures", BindingFlags.Instance | BindingFlags.NonPublic);
+    /// <summary>Kütüphanenin PawnIO EC modülü (LpcAcpiEc; IDisposable değil, Close() ile kapanır).</summary>
+    private static readonly FieldInfo? PawnModuleField =
+        typeof(WindowsEmbeddedControllerIO).GetField("_pawnModule", BindingFlags.Instance | BindingFlags.NonPublic);
 
     private delegate bool TryReadOp(byte register, out byte value);
 
@@ -115,6 +118,9 @@ public sealed class FanController : IDisposable
     public FanController()
     {
         _ecMutex = OpenEcMutex();
+        if (_ecMutex == null)
+            HataGunlugu.Write($"EC kilidi ({EcMutexName}) açılamadı (izin hatası olabilir); EC kütüphanenin kilidiyle " +
+                              "kullanılacak ve kilit program kapanana kadar tutulabilir (diğer araçlar EC'ye erişemeyebilir).");
         TryOpen();
     }
 
@@ -144,7 +150,12 @@ public sealed class FanController : IDisposable
             string fw = ReadFirmware();
             if (!IsSupported(fw))
             {
-                Fail($"Bu cihazın fan denetimi desteklenmiyor (bellenim: {(fw.Length > 0 ? fw : "okunamadı")}).", permanent: true);
+                // Bellenim daha önce doğrulandıysa (yeniden bağlanma) geçersiz okuma geçicidir (ör. uykudan dönüşte
+                // EC henüz hazır değil): denetimi kalıcı kapatma, yeniden dene
+                if (_initialized)
+                    Fail($"EC bellenimi okunamadı ({(fw.Length > 0 ? fw : "boş")}); bağlantı yeniden denenecek.", permanent: false);
+                else
+                    Fail($"Bu cihazın fan denetimi desteklenmiyor (bellenim: {(fw.Length > 0 ? fw : "okunamadı")}).", permanent: true);
                 return;
             }
 
@@ -214,7 +225,17 @@ public sealed class FanController : IDisposable
         // Kütüphane Dispose'da kendi kilit sayımını bırakır; hata vermesin diye kilidi tutarken çağrılır
         if (_ec == null) return;
         bool held = Acquire(CommandLockMs);
-        try { _ec.Dispose(); } catch { }
+        try { _ec.Dispose(); }
+        catch
+        {
+            // Kütüphane kilidi bırakamayınca (istisna) PawnIO modülünü kapatmadan çıkıyor; sürücü tanıtıcısı sızmasın
+            try
+            {
+                var module = PawnModuleField?.GetValue(_ec);
+                module?.GetType().GetMethod("Close", BindingFlags.Instance | BindingFlags.Public, Type.EmptyTypes)?.Invoke(module, null);
+            }
+            catch { }
+        }
         _ec = null;
         _read = null;
         _write = null;
@@ -446,10 +467,28 @@ public sealed class FanController : IDisposable
         _state = _state with { Cpu = _customCpu, Gpu = _customGpu, Revision = ++_revision };
     }
 
+    /// <summary>
+    /// EC bağlantısı yoksa true döner. Bağlantı geçici olarak koptuysa (yeniden kurulacak) kullanıcı tıklaması
+    /// sessizce kaybolmasın diye durum iletisi yazılır. Fan sayfası "kullanılamaz" ekranına çevrilmez: kopma
+    /// genelde birkaç saniye sürer; sayfanın gidip gelmesi düzenlenmekte olan eğriyi de gizlerdi.
+    /// </summary>
+    /// <param name="savedLater">Ayar kayıtlı olduğu için bağlantı kurulunca zaten yeniden uygulanacak mı?</param>
+    private bool Disconnected(bool savedLater)
+    {
+        if (_ec != null) return false;
+        if (_initialized)
+            _state = _state with
+            {
+                Message = savedLater ? "EC'ye yeniden bağlanılıyor…; ayar bağlantı kurulunca uygulanacak."
+                                     : "EC'ye yeniden bağlanılıyor…; işlem şu an uygulanamadı, birazdan tekrar deneyin."
+            };
+        return true;
+    }
+
     /// <summary>Özel eğriyi EC'ye yazar ve "gelişmiş" fan moduna geçer.</summary>
     public bool ApplyCustom(FanCurve cpu, FanCurve gpu)
     {
-        if (_ec == null) return false;
+        if (Disconnected(savedLater: true)) return false;
         // Doğrulanan ile yazılan aynı olsun diye önce kopyala
         cpu = cpu.Copy();
         gpu = gpu.Copy();
@@ -486,7 +525,7 @@ public sealed class FanController : IDisposable
     /// <summary>Fan yönetimini EC'nin kendi otomatik moduna bırakır.</summary>
     public bool SetAuto()
     {
-        if (_ec == null) return false;
+        if (Disconnected(savedLater: true)) return false;
         try
         {
             using var ec = EnterEc(CommandLockMs);
@@ -505,7 +544,7 @@ public sealed class FanController : IDisposable
     /// </summary>
     public bool SetFixedRpm(int cpuRpm, int gpuRpm)
     {
-        if (_ec == null) return false;
+        if (Disconnected(savedLater: true)) return false;
         try
         {
             using var ec = EnterEc(CommandLockMs);
@@ -532,7 +571,7 @@ public sealed class FanController : IDisposable
     /// <summary>Tam hız (Cooler Boost) aç/kapat.</summary>
     public bool SetManualBoost(bool on)
     {
-        if (_ec == null) return false;
+        if (Disconnected(savedLater: false)) return false;
         try
         {
             using var ec = EnterEc(CommandLockMs);
@@ -547,7 +586,7 @@ public sealed class FanController : IDisposable
     /// <summary>Performans modunu (MSI Shift) değiştirir. Yalnızca kayıt bilinen bir değerdeyse yazar.</summary>
     public bool SetPerfMode(PerfMode mode)
     {
-        if (_ec == null) return false;
+        if (Disconnected(savedLater: true)) return false;
         try
         {
             byte? value = mode switch { PerfMode.Turbo => ShiftTurbo, PerfMode.Dengeli => ShiftComfort, _ => null };

@@ -156,9 +156,12 @@ public static unsafe class GpuOverclock
         if (_version != 0) return GetInfo(_version);
         int rc = GetInfo(VersionV2);
         if (rc == 0) { _version = VersionV2; return 0; }
-        rc = GetInfo(VersionV3);
-        if (rc == 0) _version = VersionV3;
-        return rc;
+        // Kart uykuda: sürüm denemesi anlamsız; V3'ün (ör. yapı sürümü) hata kodu uyku bilgisini gizlemesin
+        if (rc == NvGpuNotPowered) return rc;
+        int rc3 = GetInfo(VersionV3);
+        if (rc3 == 0) { _version = VersionV3; return 0; }
+        // İkisi de başarısız: uyku ve bayat tutamaç kodları (yeniden deneme bunlara göre yapılır) önceliklidir
+        return rc3 == NvGpuNotPowered || IsStaleHandle(rc3) ? rc3 : rc;
     }
 
     private static int GetInfo(uint version)

@@ -133,13 +133,17 @@ public static class RtssOsd
             byte* p = _base;
             if (_capacity < OffBusy + 4 || *(uint*)p != Signature)
             {
-                CloseView(); // RTSS kapandı (0xDEAD) ya da bellek hazır değil; sonra yeniden açılacak
+                // RTSS kapandı (0xDEAD) ya da bellek hazır değil; bölümü başka bir istemci açık tutuyorsa
+                // her saniye aç/kapat yapılmasın diye birkaç saniye sonra yeniden açılacak
+                CloseView();
+                _nextOpenTry = Environment.TickCount64 + RetryOpenMs;
                 return false;
             }
             uint version = *(uint*)(p + OffVersion);
             if (version < 0x00020000)
             {
                 CloseView();
+                _nextOpenTry = Environment.TickCount64 + RetryOpenMs;
                 return false;
             }
 
@@ -149,9 +153,20 @@ public static class RtssOsd
             {
                 // _interlockedbittestandset(&dwBusy, 0)
                 int spins = 0;
+                long deadline = 0;
                 while ((Interlocked.Or(ref busy, 1) & 1) != 0)
                 {
-                    if (++spins > 200) return true; // RTSS meşgul, bir sonraki turda tekrar dene
+                    if (++spins > 200)
+                    {
+                        // Yazma: RTSS meşgul, bir sonraki turda tekrar dene. Silme (kapanış/gösterge kapatma)
+                        // sonradan yeniden denenmez; girdi oyunda kalmasın diye en çok ~50 ms daha beklenir.
+                        if (text != null) return true;
+                        long now = Environment.TickCount64;
+                        if (deadline == 0) deadline = now + 50;
+                        else if (now >= deadline) return true;
+                        Thread.Sleep((spins & 7) == 0 ? 1 : 0);
+                        continue;
+                    }
                     Thread.Yield();
                 }
             }

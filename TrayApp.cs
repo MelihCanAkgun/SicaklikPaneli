@@ -38,6 +38,9 @@ public sealed class TrayApp : ApplicationContext
     private int _readCount;
     // Ekran kartı uykudayken uygulanamayan hız aşırtma ayarı; kart uyanınca uygulanır
     private bool _ocAwaitWake;
+    // Otomatik hız aşırtma uygulamasının art arda başarısızlık sayısı; sınıra ulaşınca bu oturumda yeniden denenmez
+    private int _ocAutoFailures;
+    private const int OcAutoFailureLimit = 3;
     private bool _perfWasVisible;
     // Güç planı çağrıları sırayla ve en son istenen modla yapılır (hızlı tıklamada ters sırada bitmesin)
     private readonly object _planLock = new();
@@ -161,7 +164,7 @@ public sealed class TrayApp : ApplicationContext
     {
         var perf = _dashboard.Perf;
         perf.PerfSelected += SetPerfMode;
-        perf.OcRequested += ApplyOc;
+        perf.OcRequested += (enabled, core, memory) => ApplyOc(enabled, core, memory, userInitiated: true);
         perf.CoreTarget = Math.Clamp(_settings.GpuOcCore, 0, PerfView.CoreLimit);
         perf.MemoryTarget = Math.Clamp(_settings.GpuOcMemory, 0, PerfView.MemoryLimit);
         perf.Oc = GpuOverclock.Read();
@@ -169,7 +172,7 @@ public sealed class TrayApp : ApplicationContext
         if (_settings.GpuOcEnabled)
         {
             if (_settings.GpuOcCleanExit)
-                ApplyOc(true, perf.CoreTarget, perf.MemoryTarget);
+                ApplyOc(true, perf.CoreTarget, perf.MemoryTarget, userInitiated: false);
             else
             {
                 // Önceki oturum hız aşırtma açıkken düzgün kapanmadı (çökme olabilir): yeniden uygulama
@@ -183,9 +186,15 @@ public sealed class TrayApp : ApplicationContext
         SystemEvents.SessionEnded += _onSessionEnded;
     }
 
-    private void ApplyOc(bool enabled, int core, int memory)
+    /// <param name="userInitiated">
+    /// Kullanıcı tıkladıysa true. Otomatik uygulamada (açılış, uykudan dönüş, kart uyanınca) geçici bir sürücü
+    /// hatası tercihi silmez; ayar bekletilir ve kart uyanık görüldüğünde birkaç kez daha denenir.
+    /// </param>
+    private void ApplyOc(bool enabled, int core, int memory, bool userInitiated)
     {
         if (_closing) return; // kapanışta sıfırlanan ofset yeniden uygulanmasın
+        if (userInitiated) _ocAutoFailures = 0;
+        else if (_ocAutoFailures >= OcAutoFailureLimit) return; // bu oturumda otomatik denemeden vazgeçildi
         var perf = _dashboard.Perf;
         core = Math.Clamp(core, 0, PerfView.CoreLimit);
         memory = Math.Clamp(memory, 0, PerfView.MemoryLimit);
@@ -207,7 +216,29 @@ public sealed class TrayApp : ApplicationContext
             perf.Invalidate();
             return;
         }
+        if (!ok && !userInitiated)
+        {
+            // Otomatik uygulamada uyku dışı hata (ör. geçici NVAPI hatası): tercihi silme, sonra yeniden dene.
+            // Art arda birkaç başarısızlıktan sonra bu oturumda otomatik denemeden vazgeçilir (döngü olmasın).
+            bool retry = ++_ocAutoFailures < OcAutoFailureLimit;
+            _ocAwaitWake = retry;
+            if (enabled && _settings.GpuOcCleanExit)
+            {
+                // Ofsetlerden biri yazılmış olabilir: kapanışta sıfırlanana kadar oturum "temiz" sayılmasın
+                _settings.GpuOcCleanExit = false;
+                _settings.Save();
+            }
+            HataGunlugu.Write($"Hız aşırtma otomatik uygulanamadı ({_ocAutoFailures}/{OcAutoFailureLimit}): " + error);
+            perf.Oc = GpuOverclock.Read();
+            perf.OcEnabled = _settings.GpuOcEnabled;
+            perf.Message = "Hız aşırtma şimdilik uygulanamadı: " + error +
+                           (retry ? " Ekran kartı uyanık olduğunda yeniden denenecek."
+                                  : " Bu oturumda yeniden denenmeyecek; ayarı bu sayfadan yeniden uygulayabilirsiniz.");
+            perf.Invalidate();
+            return;
+        }
         _ocAwaitWake = false;
+        if (ok) _ocAutoFailures = 0;
         bool active = ok && enabled;
 
         _settings.GpuOcEnabled = active;
@@ -260,7 +291,7 @@ public sealed class TrayApp : ApplicationContext
 
         _ocAwaitWake = false;
         if (Same(oc.Core, core) && Same(oc.Memory, memory)) return oc;
-        ApplyOc(on, _settings.GpuOcCore, _settings.GpuOcMemory); // perf.Oc'yi de günceller
+        ApplyOc(on, _settings.GpuOcCore, _settings.GpuOcMemory, userInitiated: false); // perf.Oc'yi de günceller
         return null;
     }
 
@@ -328,7 +359,7 @@ public sealed class TrayApp : ApplicationContext
         if (e.Mode != PowerModes.Resume) return;
         FanCommand(ApplySavedFanSettings);
         // Sürücü uykudan dönüşte ofsetleri sıfırlayabilir; açıksa yeniden uygula
-        PostUi(() => { if (_settings.GpuOcEnabled) ApplyOc(true, _settings.GpuOcCore, _settings.GpuOcMemory); });
+        PostUi(() => { if (_settings.GpuOcEnabled) ApplyOc(true, _settings.GpuOcCore, _settings.GpuOcMemory, userInitiated: false); });
     }
 
     /// <summary>
@@ -450,8 +481,9 @@ public sealed class TrayApp : ApplicationContext
                     {
                         try
                         {
+                            // Gecikme burada değil, ilk başarılı okumada sıfırlanır: açılıp hemen hata veren
+                            // sensörler de artan aralıkla yeniden açılsın
                             sensors = new Sensors();
-                            reopenDelay = ReopenMinMs;
                         }
                         catch (Exception ex)
                         {
@@ -474,6 +506,7 @@ public sealed class TrayApp : ApplicationContext
                         {
                             snap = sensors.Read();
                             readFailures = 0;
+                            reopenDelay = ReopenMinMs;
                             Volatile.Write(ref _lastSensorsAt, Environment.TickCount64);
                         }
                         catch (Exception ex)
@@ -486,7 +519,8 @@ public sealed class TrayApp : ApplicationContext
                                 try { sensors.Dispose(); } catch { }
                                 sensors = null;
                                 readFailures = 0;
-                                nextOpen = Environment.TickCount64;
+                                nextOpen = Environment.TickCount64 + reopenDelay;
+                                reopenDelay = Math.Min(reopenDelay * 2, ReopenMaxMs);
                             }
                         }
                     }
@@ -891,21 +925,43 @@ public sealed class TrayApp : ApplicationContext
         if (_exited) return; // ikinci çağrı (ör. Windows kapanırken): her şey zaten bırakıldı
         _exited = true;
 
-        _uiTimer.Stop();
-        StopBackground();
+        // Adımlardan biri hata verse bile ileti döngüsü mutlaka sonlanmalı: aksi halde simgesiz,
+        // korumasız ve tek kopya kilidini tutan bir süreç açık kalır
+        try
+        {
+            Step("zamanlayıcı", () => _uiTimer.Stop());
+            Step("arka plan", StopBackground);
+            Step("kısayol", () =>
+            {
+                Native.UnregisterHotKey(_hotkeys.Handle, HotkeyId);
+                _hotkeys.DestroyHandle();
+            });
+            Step("zamanlayıcı", () => _uiTimer.Dispose());
+            Step("simge", () =>
+            {
+                var menu = _tray.ContextMenuStrip;
+                _tray.Visible = false;
+                _tray.Dispose();
+                menu?.Dispose();
+            });
+            Step("panel", () => _overlay.Close());
+            Step("pencere", () => _dashboard.Dispose());
+            Step("simge tutamacı", () =>
+            {
+                if (_lastIconHandle != IntPtr.Zero) Native.DestroyIcon(_lastIconHandle);
+                _lastIconHandle = IntPtr.Zero;
+            });
+        }
+        finally
+        {
+            base.ExitThreadCore();
+        }
 
-        Native.UnregisterHotKey(_hotkeys.Handle, HotkeyId);
-        _hotkeys.DestroyHandle();
-        _uiTimer.Dispose();
-        var menu = _tray.ContextMenuStrip;
-        _tray.Visible = false;
-        _tray.Dispose();
-        menu?.Dispose();
-        _overlay.Close();
-        _dashboard.Dispose();
-        if (_lastIconHandle != IntPtr.Zero) Native.DestroyIcon(_lastIconHandle);
-        _lastIconHandle = IntPtr.Zero;
-        base.ExitThreadCore();
+        static void Step(string name, Action action)
+        {
+            try { action(); }
+            catch (Exception ex) { HataGunlugu.Write("Kapanış: " + name, ex); }
+        }
     }
 
     private sealed class HotkeyWindow : NativeWindow

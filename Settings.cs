@@ -53,15 +53,31 @@ public sealed class Settings
     /// <summary>Diske en son yazılan içerik; aynı içerik tekrar yazılmaz.</summary>
     private byte[]? _lastSaved;
 
+    /// <summary>
+    /// Dosya var ama okunamadı (kilitli vb.); varsayılanlarla açıldı. İlk kaydetmeden önce mevcut dosya
+    /// yedeklenir: aksi halde kullanıcının ayarları (ör. fan eğrisi) varsayılanlarla ezilirdi.
+    /// </summary>
+    private bool _loadFailed;
+
     public static Settings Load()
     {
-        byte[] data;
-        try
+        byte[]? data = null;
+        for (int attempt = 0; ; attempt++)
         {
-            if (!File.Exists(FilePath)) return new Settings();
-            data = File.ReadAllBytes(FilePath);
+            try
+            {
+                if (!File.Exists(FilePath)) return new Settings();
+                data = File.ReadAllBytes(FilePath);
+                break;
+            }
+            catch
+            {
+                // Geçici kilit (ör. antivirüs taraması): kısa süre bekleyip yeniden dene
+                if (attempt >= 2) break;
+                Thread.Sleep(100);
+            }
         }
-        catch { return new Settings(); } // dosya okunamadı (kilitli vb.): bozuk sayma, dokunma
+        if (data == null) return new Settings { _loadFailed = true }; // bozuk sayma, dokunma
 
         Settings? s = null;
         try
@@ -123,6 +139,13 @@ public sealed class Settings
                 if (_lastSaved != null && json.AsSpan().SequenceEqual(_lastSaved)) return; // değişiklik yok
 
                 Directory.CreateDirectory(Dir);
+                if (_loadFailed)
+                {
+                    // Açılışta okunamayan dosyayı üzerine yazmadan önce sakla (yedek zaten varsa ona dokunma).
+                    // Kopyalanamazsa (hâlâ kilitli) yazma; sonraki kaydetmede yeniden denenir.
+                    if (File.Exists(FilePath) && !File.Exists(CorruptPath)) File.Copy(FilePath, CorruptPath);
+                    _loadFailed = false;
+                }
                 // Önce ara dosyaya yazıp diske indir, sonra tek adımda asıl dosyanın yerine koy:
                 // yazma sırasında elektrik kesilirse eski dosya sağlam kalır.
                 using (var fs = new FileStream(TempPath, FileMode.Create, FileAccess.Write, FileShare.None))
