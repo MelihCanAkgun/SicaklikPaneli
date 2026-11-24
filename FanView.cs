@@ -9,7 +9,8 @@ public sealed class FanView : PanelView
     private static readonly RectangleF CurveCard = new(20, 176, 560, 336);
     private static readonly RectangleF Plot = new(CurveCard.X + 52, CurveCard.Y + 60, CurveCard.Width - 52 - 26, CurveCard.Height - 60 - 44);
     /// <summary>Bekleyen bir komutun EC tarafından işlenmesi için beklenen en uzun süre.</summary>
-    private static readonly TimeSpan PendingTimeout = TimeSpan.FromSeconds(6);
+    private const long PendingTimeoutMs = 6000;
+    private const string ApplyingMessage = "Uygulanıyor…";
 
     public Snapshot Data = Snapshot.Empty;
     public bool ProtectionEnabled;
@@ -29,7 +30,7 @@ public sealed class FanView : PanelView
     private enum Choice { Yok, Otomatik, Ozel, Sabit, TamHiz }
     // Tıklanan mod, EC onaylayana kadar hemen seçili gösterilir
     private Choice _pending = Choice.Yok;
-    private DateTime _pendingAt;
+    private long _pendingAt; // Environment.TickCount64 (ms)
     private bool _forceCurve;
     private int _sliderDrag = -1, _sliderHover = -1; // 0: işlemci, 1: ekran kartı
 
@@ -46,7 +47,8 @@ public sealed class FanView : PanelView
     private string _localMessage = "";
     // Uygulanan eğri komutunun sıra numarası: EC işleyene kadar düzenleyiciye eski eğri geri yüklenmez
     private int _applySeq;
-    private DateTime _applyAt;
+    private long _applyAt; // Environment.TickCount64 (ms)
+    private bool _applyMessageShown; // "Uygulanıyor…" yerel mesajı komut tamamlanınca kaldırılacak
 
     private static readonly (string name, FanCurve cpu, FanCurve gpu)[] Presets =
     {
@@ -175,8 +177,8 @@ public sealed class FanView : PanelView
     {
         Data = s;
         var fan = s.Fan;
-        var now = DateTime.UtcNow;
-        if (_pending != Choice.Yok && (fan.CommandSeq >= PendingSeq || now - _pendingAt > PendingTimeout))
+        long now = Environment.TickCount64;
+        if (_pending != Choice.Yok && (fan.CommandSeq >= PendingSeq || now - _pendingAt > PendingTimeoutMs))
             _pending = Choice.Yok;
         if (_pending == Choice.Yok && _sliderDrag < 0)
         {
@@ -185,7 +187,13 @@ public sealed class FanView : PanelView
         }
         // Uygulanan eğri henüz işlenmediyse EC'deki eski eğri düzenleyiciye geri yüklenmesin (kısa süreli geri sıçrama);
         // sürükleme sırasında da düzenlenen eğri değiştirilmez
-        bool applyInFlight = fan.CommandSeq < _applySeq && now - _applyAt <= PendingTimeout;
+        bool applyInFlight = fan.CommandSeq < _applySeq && now - _applyAt <= PendingTimeoutMs;
+        // Komut tamamlanınca yerel "Uygulanıyor…" kalkar; EC'nin sonucu (ör. yazma/doğrulama hatası) görünür
+        if (_applyMessageShown && !applyInFlight)
+        {
+            _applyMessageShown = false;
+            if (_localMessage == ApplyingMessage) _localMessage = "";
+        }
         if (fan.Available && fan.Cpu != null && fan.Gpu != null &&
             (_cpu == null || (fan.Revision != _loadedRevision && !_dirty && _drag < 0 && !applyInFlight)))
         {
@@ -217,7 +225,7 @@ public sealed class FanView : PanelView
     private void SetPending(Choice c)
     {
         _pending = c;
-        _pendingAt = DateTime.UtcNow;
+        _pendingAt = Environment.TickCount64;
         _forceCurve = false;
         _localMessage = "";
     }
@@ -561,7 +569,7 @@ public sealed class FanView : PanelView
                   (_gpu.SameAs(fan.FactoryGpu) || _gpu.IsValid(out err));
         if (!ok) { _localMessage = err; return; }
         SetPending(Choice.Ozel);
-        _localMessage = "Uygulanıyor…";
+        _localMessage = ApplyingMessage;
         _dirty = false;
         _loadedRevision = -1; // EC'den geri okunan eğriyi yükle
         int before = PendingSeq;
@@ -570,7 +578,8 @@ public sealed class FanView : PanelView
         if (PendingSeq != before)
         {
             _applySeq = PendingSeq;
-            _applyAt = DateTime.UtcNow;
+            _applyAt = Environment.TickCount64;
+            _applyMessageShown = true;
         }
     }
 
