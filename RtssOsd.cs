@@ -13,126 +13,227 @@ namespace SicaklikPaneli;
 public static class RtssOsd
 {
     private const string MapName = "RTSSSharedMemoryV2";
-    private const string Owner = "SicaklikPaneli";
     private const uint Signature = 0x52545353; // 'RTSS'
+
+    // Girdi sahibi adı (bilerek "SicaklikPaneli"); karşılaştırma için hazır ANSI baytları
+    private static ReadOnlySpan<byte> OwnerBytes => "SicaklikPaneli"u8;
 
     // RTSS_SHARED_MEMORY alan konumları
     private const int OffVersion = 4, OffOsdEntrySize = 20, OffOsdArrOffset = 24, OffOsdArrSize = 28,
                       OffOsdFrame = 32, OffBusy = 36;
     // RTSS_SHARED_MEMORY_OSD_ENTRY alan konumları
-    private const int OffSzOsd = 0, OffSzOwner = 256, OffSzOsdEx = 512, SzOsdExLen = 4096;
+    private const int OffSzOsd = 0, OffSzOwner = 256, OffSzOsdEx = 512, SzOsdLen = 256, SzOwnerLen = 256, SzOsdExLen = 4096;
 
-    private static readonly Encoding Ansi = Encoding.Latin1; // '°' = 0xB0
+    private static readonly Encoding Ansi = Encoding.Latin1; // '°' = 0xB0, her karakter tek bayt
+
+    // Görünüm önbelleği: her saniye OpenFileMapping/MapViewOfFile yapmamak için açık tutulur.
+    // RTSS çökerse imza 'RTSS' olarak kalabilir; bu yüzden belirli aralıklarla kapatılıp yeniden açılır.
+    private const int ReopenEvery = 10;
+    private static readonly object Sync = new();
+    private static MemoryMappedFile? _mmf;
+    private static MemoryMappedViewAccessor? _view;
+    private static unsafe byte* _base;
+    private static long _capacity;
+    private static int _uses;
+    private static bool _shutdown;
 
     /// <summary>Yazıyı RTSS'e gönderir. RTSS çalışmıyorsa false döner.</summary>
-    public static bool Update(string text) => Access(text);
+    public static bool Update(string text)
+    {
+        lock (Sync)
+        {
+            if (_shutdown) return false;
+            return Access(text);
+        }
+    }
 
     /// <summary>Bizim OSD girdimizi RTSS'ten kaldırır.</summary>
-    public static void Release() => Access(null);
-
-    private static unsafe bool Access(string? text)
+    public static void Release()
     {
+        lock (Sync)
+        {
+            Access(null);
+            CloseView(); // gösterge kapalıyken RTSS belleğini tutmaya gerek yok
+        }
+    }
+
+    /// <summary>
+    /// Program kapanırken çağrılır: girdimizi kaldırır ve sonradan gelen Update çağrılarını
+    /// yok sayar (arka plan döngüsü kapanış sırasında girdiyi yeniden almasın).
+    /// </summary>
+    public static void Shutdown()
+    {
+        lock (Sync)
+        {
+            _shutdown = true;
+            Access(null);
+            CloseView();
+        }
+    }
+
+    private static unsafe bool OpenView()
+    {
+        if (_view != null)
+        {
+            if (++_uses < ReopenEvery) return true;
+            CloseView();
+        }
+
+        MemoryMappedFile? mmf = null;
+        MemoryMappedViewAccessor? view = null;
         try
         {
-            using var mmf = MemoryMappedFile.OpenExisting(MapName, MemoryMappedFileRights.ReadWrite);
-            using var view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
+            mmf = MemoryMappedFile.OpenExisting(MapName, MemoryMappedFileRights.ReadWrite);
+            view = mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.ReadWrite);
             byte* p = null;
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref p);
-            try
-            {
-                p += view.PointerOffset;
-                if (*(uint*)p != Signature) return false;
-                uint version = *(uint*)(p + OffVersion);
-                if (version < 0x00020000) return false;
-
-                bool useLock = version >= 0x0002000E;
-                ref int busy = ref *(int*)(p + OffBusy);
-                if (useLock)
-                {
-                    // _interlockedbittestandset(&dwBusy, 0)
-                    int spins = 0;
-                    while ((Interlocked.Or(ref busy, 1) & 1) != 0)
-                    {
-                        if (++spins > 200) return true; // RTSS meşgul, bir sonraki turda tekrar dene
-                        Thread.Yield();
-                    }
-                }
-
-                try
-                {
-                    uint entrySize = *(uint*)(p + OffOsdEntrySize);
-                    uint arrOffset = *(uint*)(p + OffOsdArrOffset);
-                    uint arrSize = *(uint*)(p + OffOsdArrSize);
-                    bool hasEx = version >= 0x00020007;
-
-                    // 1. tur: kendi girdimizi ara. 2. tur: boş bir girdi kap (yalnızca yazarken).
-                    for (int pass = 0; pass < 2; pass++)
-                    {
-                        for (uint i = 1; i < arrSize; i++) // 0. girdi RTSS'in kendisine ayrılmış
-                        {
-                            byte* e = p + arrOffset + i * entrySize;
-                            byte* owner = e + OffSzOwner;
-
-                            if (pass == 1)
-                            {
-                                if (text == null) return true;
-                                if (owner[0] == 0) WriteStr(owner, Owner, 256);
-                            }
-
-                            if (ReadStr(owner, 256) != Owner) continue;
-
-                            if (text == null)
-                            {
-                                new Span<byte>(e, 256).Clear();
-                                new Span<byte>(owner, 256).Clear();
-                                if (hasEx) new Span<byte>(e + OffSzOsdEx, SzOsdExLen).Clear();
-                            }
-                            else if (hasEx)
-                            {
-                                WriteStr(e + OffSzOsdEx, text, SzOsdExLen);
-                                new Span<byte>(e + OffSzOsd, 256).Clear();
-                            }
-                            else
-                            {
-                                WriteStr(e + OffSzOsd, text, 256);
-                            }
-
-                            Interlocked.Increment(ref *(int*)(p + OffOsdFrame));
-                            return true;
-                        }
-                    }
-                    return true; // boş girdi yok ama RTSS çalışıyor
-                }
-                finally
-                {
-                    if (useLock) Interlocked.And(ref busy, ~1);
-                }
-            }
-            finally
-            {
-                view.SafeMemoryMappedViewHandle.ReleasePointer();
-            }
+            _mmf = mmf;
+            _view = view;
+            _base = p + view.PointerOffset;
+            _capacity = view.Capacity;
+            _uses = 0;
+            return true;
         }
         catch
         {
+            view?.Dispose();
+            mmf?.Dispose();
             return false; // RTSS çalışmıyor
         }
     }
 
-    private static unsafe void WriteStr(byte* dst, string s, int max)
+    private static unsafe void CloseView()
     {
-        var bytes = Ansi.GetBytes(s);
-        int n = Math.Min(bytes.Length, max - 1);
-        var span = new Span<byte>(dst, max);
-        span.Clear();
-        bytes.AsSpan(0, n).CopyTo(span);
+        if (_view != null)
+        {
+            try { _view.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+            _view.Dispose();
+            _view = null;
+        }
+        _mmf?.Dispose();
+        _mmf = null;
+        _base = null;
+        _capacity = 0;
     }
 
-    private static unsafe string ReadStr(byte* src, int max)
+    // Sync kilidi altında çağrılmalıdır.
+    private static unsafe bool Access(string? text)
     {
-        var span = new ReadOnlySpan<byte>(src, max);
-        int len = span.IndexOf((byte)0);
-        return Ansi.GetString(len < 0 ? span : span[..len]);
+        if (!OpenView()) return false;
+        try
+        {
+            byte* p = _base;
+            if (_capacity < OffBusy + 4 || *(uint*)p != Signature)
+            {
+                CloseView(); // RTSS kapandı (0xDEAD) ya da bellek hazır değil; sonra yeniden açılacak
+                return false;
+            }
+            uint version = *(uint*)(p + OffVersion);
+            if (version < 0x00020000)
+            {
+                CloseView();
+                return false;
+            }
+
+            bool useLock = version >= 0x0002000E;
+            ref int busy = ref *(int*)(p + OffBusy);
+            if (useLock)
+            {
+                // _interlockedbittestandset(&dwBusy, 0)
+                int spins = 0;
+                while ((Interlocked.Or(ref busy, 1) & 1) != 0)
+                {
+                    if (++spins > 200) return true; // RTSS meşgul, bir sonraki turda tekrar dene
+                    Thread.Yield();
+                }
+            }
+
+            try
+            {
+                uint entrySize = *(uint*)(p + OffOsdEntrySize);
+                uint arrOffset = *(uint*)(p + OffOsdArrOffset);
+                uint arrSize = *(uint*)(p + OffOsdArrSize);
+                bool hasEx = version >= 0x00020007;
+
+                // Bozuk/beklenmedik düzen: görünüm dışına yazmak süreci çökertir, dokunma
+                uint minEntry = hasEx ? (uint)(OffSzOsdEx + SzOsdExLen) : (uint)(OffSzOwner + SzOwnerLen);
+                if (entrySize < minEntry || (ulong)arrOffset + (ulong)arrSize * entrySize > (ulong)_capacity)
+                    return false;
+
+                // Metni bir kez, yığında ANSI'ye çevir (Latin1: karakter başına tek bayt)
+                int max = hasEx ? SzOsdExLen : SzOsdLen;
+                Span<byte> buf = stackalloc byte[max - 1];
+                int n = 0;
+                if (text != null) n = Ansi.GetBytes(text.AsSpan(0, Math.Min(text.Length, max - 1)), buf);
+                ReadOnlySpan<byte> bytes = buf[..n];
+
+                // 1. tur: kendi girdimizi ara. 2. tur: boş bir girdi kap (yalnızca yazarken).
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    for (uint i = 1; i < arrSize; i++) // 0. girdi RTSS'in kendisine ayrılmış
+                    {
+                        byte* e = p + arrOffset + (ulong)i * entrySize;
+                        byte* owner = e + OffSzOwner;
+
+                        if (pass == 1)
+                        {
+                            if (text == null) return true;
+                            if (owner[0] == 0) WriteBytes(owner, OwnerBytes, SzOwnerLen);
+                        }
+
+                        if (!FieldEquals(owner, SzOwnerLen, OwnerBytes)) continue;
+
+                        if (text == null)
+                        {
+                            new Span<byte>(e + OffSzOsd, SzOsdLen).Clear();
+                            new Span<byte>(owner, SzOwnerLen).Clear();
+                            if (hasEx) new Span<byte>(e + OffSzOsdEx, SzOsdExLen).Clear();
+                        }
+                        else if (hasEx)
+                        {
+                            // Metin değişmediyse yeniden yazma, çerçeve sayacını artırma
+                            if (pass == 0 && e[OffSzOsd] == 0 && FieldEquals(e + OffSzOsdEx, SzOsdExLen, bytes)) return true;
+                            WriteBytes(e + OffSzOsdEx, bytes, SzOsdExLen);
+                            new Span<byte>(e + OffSzOsd, SzOsdLen).Clear();
+                        }
+                        else
+                        {
+                            if (pass == 0 && FieldEquals(e + OffSzOsd, SzOsdLen, bytes)) return true;
+                            WriteBytes(e + OffSzOsd, bytes, SzOsdLen);
+                        }
+
+                        Interlocked.Increment(ref *(int*)(p + OffOsdFrame));
+                        return true;
+                    }
+                }
+                return true; // boş girdi yok ama RTSS çalışıyor
+            }
+            finally
+            {
+                if (useLock) Interlocked.And(ref busy, ~1);
+            }
+        }
+        catch
+        {
+            CloseView();
+            return false; // RTSS çalışmıyor
+        }
+    }
+
+    /// <summary>Hedefi temizler ve baytları null sonlandırmalı olarak yazar.</summary>
+    private static unsafe void WriteBytes(byte* dst, ReadOnlySpan<byte> src, int max)
+    {
+        var span = new Span<byte>(dst, max);
+        span.Clear();
+        src[..Math.Min(src.Length, max - 1)].CopyTo(span);
+    }
+
+    /// <summary>Null sonlandırmalı alan, verilen baytlarla birebir aynı mı?</summary>
+    private static unsafe bool FieldEquals(byte* field, int max, ReadOnlySpan<byte> value)
+    {
+        if (value.Length >= max) return false;
+        var span = new ReadOnlySpan<byte>(field, value.Length + 1);
+        return span[value.Length] == 0 && span[..value.Length].SequenceEqual(value);
     }
 
     // ---------------- RTSS'i bulma / başlatma ----------------
@@ -156,17 +257,30 @@ public static class RtssOsd
         return null;
     }
 
-    public static bool IsRunning() => Process.GetProcessesByName("RTSS").Length > 0;
+    public static bool IsRunning()
+    {
+        var procs = Process.GetProcessesByName("RTSS");
+        foreach (var p in procs) p.Dispose();
+        return procs.Length > 0;
+    }
+
+    /// <summary>RTSS'in paylaşımlı belleği şu an geçerli mi (süreç taramasından çok daha ucuz)?</summary>
+    private static unsafe bool IsMemoryLive()
+    {
+        lock (Sync)
+            return _view != null && _capacity >= 4 && *(uint*)_base == Signature;
+    }
 
     /// <summary>RTSS kuruluysa ve çalışmıyorsa simge durumunda başlatır.</summary>
     public static void EnsureStarted()
     {
-        if (IsRunning()) return;
+        if (IsMemoryLive()) return; // bellek canlıysa RTSS zaten çalışıyor
         var exe = FindExe();
         if (exe == null) return;
+        if (IsRunning()) return;
         try
         {
-            Process.Start(new ProcessStartInfo(exe)
+            using var _ = Process.Start(new ProcessStartInfo(exe)
             {
                 UseShellExecute = true,
                 WorkingDirectory = Path.GetDirectoryName(exe)!,

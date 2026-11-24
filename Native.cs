@@ -1,9 +1,8 @@
 using System.Runtime.InteropServices;
-using System.Text;
 
 namespace SicaklikPaneli;
 
-internal static class Native
+internal static partial class Native
 {
     public const int WS_EX_LAYERED = 0x80000;
     public const int WS_EX_TRANSPARENT = 0x20;
@@ -14,14 +13,15 @@ internal static class Native
     public static readonly IntPtr HWND_TOPMOST = new(-1);
     public const uint SWP_NOMOVE = 0x2, SWP_NOSIZE = 0x1, SWP_NOACTIVATE = 0x10, SWP_SHOWWINDOW = 0x40;
 
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
-    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
-    [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
-    [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    // Kaynak üretimli P/Invoke (LibraryImport): çalışma anında marshalling kodu üretilmez
+    [LibraryImport("user32.dll")] public static partial IntPtr GetForegroundWindow();
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [LibraryImport("user32.dll", EntryPoint = "GetClassNameW")] private static unsafe partial int GetClassName(IntPtr hWnd, char* buf, int max);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool DestroyIcon(IntPtr hIcon);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
+    [LibraryImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static partial bool UnregisterHotKey(IntPtr hWnd, int id);
+    [LibraryImport("user32.dll")] public static partial uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT { public int Left, Top, Right, Bottom; }
@@ -33,8 +33,12 @@ internal static class Native
         "XamlExplorerHostIslandWindow", "TaskManagerWindow"
     };
 
+    // Sınıf adını string üretmeden aramak için (500 ms'de bir çağrılıyor, çöp üretmesin)
+    private static readonly HashSet<string>.AlternateLookup<ReadOnlySpan<char>> ShellClassLookup =
+        ShellClasses.GetAlternateLookup<ReadOnlySpan<char>>();
+
     /// <summary>Ön plandaki pencere tüm ekranı kaplıyorsa (oyun, tam ekran uygulama) true döner.</summary>
-    public static bool IsForegroundFullscreen(out Screen? screen)
+    public static unsafe bool IsForegroundFullscreen(out Screen? screen)
     {
         screen = null;
         IntPtr hwnd = GetForegroundWindow();
@@ -43,9 +47,10 @@ internal static class Native
         GetWindowThreadProcessId(hwnd, out uint pid);
         if (pid == Environment.ProcessId) return false;
 
-        var sb = new StringBuilder(256);
-        GetClassName(hwnd, sb, sb.Capacity);
-        if (ShellClasses.Contains(sb.ToString())) return false;
+        char* buf = stackalloc char[256];
+        int len = GetClassName(hwnd, buf, 256);
+        if (len < 0) len = 0;
+        if (ShellClassLookup.Contains(new ReadOnlySpan<char>(buf, len))) return false;
 
         if (!GetWindowRect(hwnd, out RECT r)) return false;
         var rect = Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
