@@ -132,14 +132,27 @@ public static class DragonLogo
     public static Bitmap Render(int size, bool headOnly = true)
     {
         var grid = size < 32 ? Small : headOnly ? Head : Large;
-        var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         int n = grid.Length;
+        // Pikseller önce bir diziye yazılıp tek seferde kopyalanır (piksel başına SetPixel kilitlemesi yerine).
+        // Değerler SetPixel'in yazacağıyla birebir aynıdır (bilinmeyen karakter: Color.Transparent).
+        int transparent = Color.Transparent.ToArgb();
+        var pixels = new int[size * size];
         for (int y = 0; y < size; y++)
+        {
+            string row = grid[y * n / size];
             for (int x = 0; x < size; x++)
-            {
-                char c = grid[y * n / size][x * n / size];
-                bmp.SetPixel(x, y, Palette.TryGetValue(c, out var col) ? col : Color.Transparent);
-            }
+                pixels[y * size + x] = Palette.TryGetValue(row[x * n / size], out var col) ? col.ToArgb() : transparent;
+        }
+
+        var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        var data = bmp.LockBits(new Rectangle(0, 0, size, size), System.Drawing.Imaging.ImageLockMode.WriteOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            for (int y = 0; y < size; y++)
+                System.Runtime.InteropServices.Marshal.Copy(pixels, y * size, data.Scan0 + y * data.Stride, size);
+        }
+        finally { bmp.UnlockBits(data); }
         return bmp;
     }
 
@@ -160,6 +173,9 @@ public static class DragonLogo
     public static Icon LoadIcon()
     {
         using var stream = typeof(DragonLogo).Assembly.GetManifestResourceStream("DragonSaj.ico");
-        return stream != null ? new Icon(stream) : Icon.FromHandle(Render(32).GetHicon());
+        if (stream != null) return new Icon(stream);
+        // Yedek yol: GetHicon bitmap'i kopyaladığı için geçici bitmap hemen bırakılabilir
+        using var bmp = Render(32);
+        return Icon.FromHandle(bmp.GetHicon());
     }
 }
