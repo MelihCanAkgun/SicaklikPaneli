@@ -12,7 +12,8 @@ public record Snapshot(float? CpuTemp, float? CpuLoad, float? GpuTemp, float? Gp
     public float? RamTotal { get; init; }      // GB
     public bool CpuThrottle { get; init; }
     public bool GpuThrottle { get; init; }
-    public FanState Fan { get; init; } = FanState.Unavailable("Fan bilgisi bekleniyor…");
+    // Varsayılan paylaşılır: her Snapshot'ta yeni bir FanState ayrılmasın (FanState değişmez)
+    public FanState Fan { get; init; } = FanState.Waiting;
 
     public static readonly Snapshot Empty = new(null, null, null, null, "CPU", "GPU");
 }
@@ -88,4 +89,7 @@ public sealed record FanState
     public int Revision { get; init; }          // eğriler EC'den her yeniden okunduğunda artar
 
     public static FanState Unavailable(string message) => new() { Available = false, Message = message };
+
+    /// <summary>Henüz fan bilgisi gelmediğinde kullanılan ortak örnek.</summary>
+    public static readonly FanState Waiting = Unavailable("Fan bilgisi bekleniyor…");
 }
