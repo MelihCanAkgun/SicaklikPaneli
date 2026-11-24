@@ -19,11 +19,30 @@ public abstract class PanelView : Control
     private readonly List<(RectangleF rect, Action action)> _hits = new();
     private PointF _mouse = new(-1, -1);
     private int _hotIndex = -1;
+    private readonly Action[] _tabActions;
+
+    // Çizim nesneleri her karede yeniden oluşturulmasın diye bir kez oluşturulup saklanır.
+    // Yazı tipleri piksel biriminde olduğundan ölçekten bağımsızdır; hepsi yalnızca arayüz
+    // iş parçacığında kullanılır ve program boyunca yaşar.
+    private static readonly Dictionary<(float px, bool semibold, bool number), Font> s_fonts = new();
+    private static readonly Dictionary<int, SolidBrush> s_brushes = new();
+    private static readonly Dictionary<int, Pen> s_pens = new();
+    private static readonly StringFormat s_center = new() { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
 
     protected PanelView()
     {
-        DoubleBuffered = true;
+        // Her kare Render içinde tamamen boyanır: arka plan silmeye gerek yok (Opaque),
+        // titreme olmasın diye çift tampon, ölçek genişliğe bağlı olduğu için boyut değişince tümü yeniden çizilir.
+        SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
+               | ControlStyles.Opaque | ControlStyles.ResizeRedraw, true);
         BackColor = Theme.Background;
+
+        _tabActions = new Action[Tabs.Length];
+        for (int i = 0; i < Tabs.Length; i++)
+        {
+            int index = i;
+            _tabActions[i] = () => TabSelected?.Invoke(index);
+        }
     }
 
     protected float ViewScale => Width / (float)LogicalWidth;
@@ -45,6 +64,38 @@ public abstract class PanelView : Control
 
     protected abstract void DrawContent(Graphics g);
 
+    // ---------------- Önbellekli çizim nesneleri ----------------
+
+    /// <summary>Theme.Font ile aynı yazı tipi; önbellekten gelir, Dispose EDİLMEMELİ.</summary>
+    private protected static Font CachedFont(float px, bool semibold = false) => GetFont(px, semibold, false);
+
+    /// <summary>Theme.Number ile aynı yazı tipi; önbellekten gelir, Dispose EDİLMEMELİ.</summary>
+    private protected static Font CachedNumber(float px) => GetFont(px, false, true);
+
+    private static Font GetFont(float px, bool semibold, bool number)
+    {
+        var key = (px, semibold, number);
+        if (!s_fonts.TryGetValue(key, out var f))
+            s_fonts[key] = f = number ? Theme.Number(px) : Theme.Font(px, semibold);
+        return f;
+    }
+
+    /// <summary>Renge göre önbellekli fırça; Dispose EDİLMEMELİ.</summary>
+    private protected static SolidBrush CachedBrush(Color c)
+    {
+        int key = c.ToArgb();
+        if (!s_brushes.TryGetValue(key, out var b)) s_brushes[key] = b = new SolidBrush(c);
+        return b;
+    }
+
+    /// <summary>Renge göre önbellekli 1 piksellik kalem; Dispose EDİLMEMELİ.</summary>
+    private protected static Pen CachedPen(Color c)
+    {
+        int key = c.ToArgb();
+        if (!s_pens.TryGetValue(key, out var p)) s_pens[key] = p = new Pen(c, 1);
+        return p;
+    }
+
     // ---------------- Ortak çizimler ----------------
 
     private void DrawHeader(Graphics g, float scale)
@@ -56,13 +107,12 @@ public abstract class PanelView : Control
         float lx = MathF.Round(14 * scale) / scale, ly = MathF.Round((35 - logo * 18 / 32) * scale) / scale;
         DragonLogo.Draw(g, new RectangleF(lx, ly, logo, logo));
 
-        using var title = Theme.Font(22, true);
-        using var tb = new SolidBrush(Theme.Text);
-        g.DrawString("Dragon Saj", title, tb, lx + logo + 6, 20);
+        var tb = CachedBrush(Theme.Text);
+        g.DrawString("Dragon Saj", CachedFont(22, true), tb, lx + logo + 6, 20);
 
         // Sekmeler
-        using var tabFont = Theme.Font(14, true);
-        using var muted = new SolidBrush(Theme.Muted);
+        var tabFont = CachedFont(14, true);
+        var muted = CachedBrush(Theme.Muted);
         float x = 262;
         for (int i = 0; i < Tabs.Length; i++)
         {
@@ -71,34 +121,30 @@ public abstract class PanelView : Control
             bool active = i == ActiveTab;
             g.DrawString(Tabs[i], tabFont, active || Hot(rect) ? tb : muted, x, 27);
             if (active) Theme.FillRounded(g, Theme.Accent, new RectangleF(x + 2, 49, w - 4, 3), 1.5f);
-            int index = i;
-            Hit(rect, () => TabSelected?.Invoke(index));
+            Hit(rect, _tabActions[i]);
             x += w + 26;
         }
 
         string status = RtssConnected ? "Oyun içi gösterge etkin"
                       : RtssInstalled ? "Oyun içi gösterge bekleniyor" : "RTSS kurulu değil";
-        using var small = Theme.Font(12);
+        var small = CachedFont(12);
         var size = g.MeasureString(status, small);
         float sx = LogicalWidth - 20 - size.Width;
         g.DrawString(status, small, muted, sx, 27);
-        using var dot = new SolidBrush(RtssConnected ? Theme.Ok : Theme.Muted);
-        g.FillEllipse(dot, sx - 14, 31, 8, 8);
+        g.FillEllipse(CachedBrush(RtssConnected ? Theme.Ok : Theme.Muted), sx - 14, 31, 8, 8);
     }
 
     protected static void DrawCard(Graphics g, RectangleF r, Color? border = null)
     {
-        Theme.FillRounded(g, Theme.Card, r, 12);
+        // Dolgu ve kenar aynı yolu kullanır; yol bir kez oluşturulur
         using var path = Theme.RoundedRect(r, 12);
-        using var pen = new Pen(border ?? Theme.CardBorder, 1);
-        g.DrawPath(pen, path);
+        g.FillPath(CachedBrush(Theme.Card), path);
+        g.DrawPath(CachedPen(border ?? Theme.CardBorder), path);
     }
 
     protected static void DrawLabel(Graphics g, string text, float x, float y, Color? color = null)
     {
-        using var font = Theme.Font(12, true);
-        using var b = new SolidBrush(color ?? Theme.Muted);
-        g.DrawString(text, font, b, x, y);
+        g.DrawString(text, CachedFont(12, true), CachedBrush(color ?? Theme.Muted), x, y);
     }
 
     /// <summary>Düğme çizer ve tıklama alanını kaydeder. active: seçili (dolu) görünüm.</summary>
@@ -107,17 +153,13 @@ public abstract class PanelView : Control
     {
         Color fill = active ? activeColor ?? Theme.Accent
                    : enabled && Hot(rect) ? Color.FromArgb(46, 46, 55) : Color.FromArgb(33, 33, 39);
-        Theme.FillRounded(g, fill, rect, 8);
-        if (!active)
+        using (var path = Theme.RoundedRect(rect, 8))
         {
-            using var path = Theme.RoundedRect(rect, 8);
-            using var pen = new Pen(Theme.CardBorder);
-            g.DrawPath(pen, path);
+            g.FillPath(CachedBrush(fill), path);
+            if (!active) g.DrawPath(CachedPen(Theme.CardBorder), path);
         }
-        using var font = Theme.Font(fontSize, active);
-        using var brush = new SolidBrush(active ? Color.White : enabled ? Theme.Text : Color.FromArgb(96, 96, 106));
-        var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-        g.DrawString(text, font, brush, rect, fmt);
+        var brush = CachedBrush(active ? Color.White : enabled ? Theme.Text : Color.FromArgb(96, 96, 106));
+        g.DrawString(text, CachedFont(fontSize, active), brush, rect, s_center);
         if (enabled) Hit(rect, onClick);
     }
 
@@ -139,6 +181,7 @@ public abstract class PanelView : Control
         _mouse = ToLogical(e.Location);
         int hot = HitIndex(_mouse);
         if (!HandlesCursor) Cursor = hot >= 0 ? Cursors.Hand : Cursors.Default;
+        // Yalnızca fareyle üzerine gelinen hedef değişince yeniden çiz
         if (hot != _hotIndex) { _hotIndex = hot; Invalidate(); }
     }
 
@@ -150,6 +193,14 @@ public abstract class PanelView : Control
         base.OnMouseLeave(e);
         _mouse = new PointF(-1, -1);
         if (_hotIndex != -1) { _hotIndex = -1; Invalidate(); }
+    }
+
+    protected override void OnVisibleChanged(EventArgs e)
+    {
+        base.OnVisibleChanged(e);
+        // Sayfa gizlenirken eski fare konumu kalmasın; yeniden açıldığında ilk karede
+        // yanlış düğme/sekme vurgulu görünmesin (fare hareket edince zaten güncellenir)
+        if (!Visible) { _mouse = new PointF(-1, -1); _hotIndex = -1; }
     }
 
     protected override void OnMouseClick(MouseEventArgs e)

@@ -20,6 +20,42 @@ public sealed class DashboardView : PanelView
         (PanelMode.Otomatik, "Otomatik"), (PanelMode.HerZaman, "Her zaman"), (PanelMode.Kapali, "Kapalı")
     };
 
+    private static readonly int[] GridTemps = { 40, 60, 80, 100 };
+    private static readonly string[] GridLabels = { "40°", "60°", "80°", "100°" };
+
+    // Her karede yeniden oluşturulmayan çizim nesneleri (yalnızca arayüz iş parçacığında kullanılır)
+    private static readonly StringFormat EllipsisFormat = new() { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+    private static readonly StringFormat CenterFormat = new() { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+    private static readonly StringFormat FarFormat = new() { Alignment = StringAlignment.Far };
+    private static readonly StringFormat AxisFormat = new() { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
+    private static readonly Pen TrackPen = new(Theme.Track, 11) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+    private static readonly Pen GridPen = new(Color.FromArgb(40, 40, 48), 1);
+    private static readonly Pen CpuSeriesPen = new(Theme.Cpu, 2f) { LineJoin = LineJoin.Round };
+    private static readonly Pen GpuSeriesPen = new(Theme.Gpu, 2f) { LineJoin = LineJoin.Round };
+
+    // Farklı yazı tiplerini aynı taban çizgisine oturtan sabit kaydırmalar
+    private static readonly float StatLabelOffset = Theme.Ascent(CachedNumber(17)) - Theme.Ascent(CachedFont(12));
+    private static readonly float RamUnitOffset = Theme.Ascent(CachedNumber(36)) - Theme.Ascent(CachedFont(13));
+
+    // Geçmiş grafiği noktaları için yeniden kullanılan tampon
+    private PointF[] _points = Array.Empty<PointF>();
+
+    // Düğme eylemleri her karede yeni kapanış (closure) üretmesin diye bir kez oluşturulur
+    private readonly Action _turbo, _balanced;
+    private readonly Action[] _segmentActions;
+
+    public DashboardView()
+    {
+        _turbo = () => PerfSelected?.Invoke(PerfMode.Turbo);
+        _balanced = () => PerfSelected?.Invoke(PerfMode.Dengeli);
+        _segmentActions = new Action[Segments.Length];
+        for (int i = 0; i < Segments.Length; i++)
+        {
+            var mode = Segments[i].mode;
+            _segmentActions[i] = () => ModeSelected?.Invoke(mode);
+        }
+    }
+
     protected override void DrawContent(Graphics g)
     {
         var fan = Data.Fan;
@@ -49,11 +85,8 @@ public sealed class DashboardView : PanelView
         DrawCard(g, r, throttle ? Theme.Warning : null);
 
         DrawLabel(g, label, r.X + 18, r.Y + 14, color);
-        using var nameFont = Theme.Font(12);
-        using var muted = new SolidBrush(Theme.Muted);
         var nameRect = new RectangleF(r.X + 18, r.Y + 32, throttle ? r.Width - 190 : r.Width - 36, 18);
-        using (var fmt = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
-            g.DrawString(name, nameFont, muted, nameRect, fmt);
+        g.DrawString(name, CachedFont(12), CachedBrush(Theme.Muted), nameRect, EllipsisFormat);
 
         if (throttle) DrawThrottleBadge(g, r.Right - 16, r.Y + 14);
 
@@ -71,21 +104,19 @@ public sealed class DashboardView : PanelView
     private static void DrawThrottleBadge(Graphics g, float right, float y)
     {
         const string text = "Isıl kısıtlama";
-        using var font = Theme.Font(11, true);
+        var font = CachedFont(11, true);
         float tw = g.MeasureString(text, font).Width;
         var rect = new RectangleF(right - tw - 34, y, tw + 34, 24);
         Theme.FillRounded(g, Color.FromArgb(60, Theme.Warning), rect, 12);
         Theme.WarningTriangle(g, new RectangleF(rect.X + 9, rect.Y + 5.5f, 14, 12.5f));
-        using var b = new SolidBrush(Color.FromArgb(255, 150, 150));
-        g.DrawString(text, font, b, rect.X + 27, rect.Y + 4);
+        g.DrawString(text, font, CachedBrush(Color.FromArgb(255, 150, 150)), rect.X + 27, rect.Y + 4);
     }
 
     private static void DrawGauge(Graphics g, PointF c, float radius, float? temp)
     {
         const float start = 135, sweep = 270, thickness = 11;
         var rect = new RectangleF(c.X - radius, c.Y - radius, radius * 2, radius * 2);
-        using (var track = new Pen(Theme.Track, thickness) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-            g.DrawArc(track, rect, start, sweep);
+        g.DrawArc(TrackPen, rect, start, sweep);
 
         if (temp is float t)
         {
@@ -94,26 +125,16 @@ public sealed class DashboardView : PanelView
             g.DrawArc(pen, rect, start, sweep * frac);
         }
 
-        using var big = Theme.Number(46);
-        using var unit = Theme.Font(14);
-        using var tb = new SolidBrush(Theme.Text);
-        using var mb = new SolidBrush(Theme.Muted);
         string text = temp.HasValue ? temp.Value.ToString("0") : "--";
-        var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-        g.DrawString(text, big, tb, new RectangleF(rect.X, rect.Y - 6, rect.Width, rect.Height), fmt);
-        g.DrawString("°C", unit, mb, new RectangleF(rect.X, c.Y + 26, rect.Width, 20), fmt);
+        g.DrawString(text, CachedNumber(46), CachedBrush(Theme.Text), new RectangleF(rect.X, rect.Y - 6, rect.Width, rect.Height), CenterFormat);
+        g.DrawString("°C", CachedFont(14), CachedBrush(Theme.Muted), new RectangleF(rect.X, c.Y + 26, rect.Width, 20), CenterFormat);
     }
 
     private static void DrawStat(Graphics g, float x, float y, float w, string label, string value,
         float? percent, Color color, bool withBar)
     {
-        using var labelFont = Theme.Font(12);
-        using var valueFont = Theme.Number(17);
-        using var muted = new SolidBrush(Theme.Muted);
-        using var text = new SolidBrush(Theme.Text);
-        g.DrawString(label, labelFont, muted, x, y + Theme.Ascent(valueFont) - Theme.Ascent(labelFont));
-        using var right = new StringFormat { Alignment = StringAlignment.Far };
-        g.DrawString(value, valueFont, text, new RectangleF(x, y, w, 24), right);
+        g.DrawString(label, CachedFont(12), CachedBrush(Theme.Muted), x, y + StatLabelOffset);
+        g.DrawString(value, CachedNumber(17), CachedBrush(Theme.Text), new RectangleF(x, y, w, 24), FarFormat);
         if (withBar) Theme.Bar(g, new RectangleF(x + 2, y + 28, w - 4, 6), percent, color);
     }
 
@@ -123,61 +144,59 @@ public sealed class DashboardView : PanelView
     {
         DrawCard(g, r);
         DrawLabel(g, "Sıcaklık geçmişi", r.X + 18, r.Y + 14);
-        using var small = Theme.Font(11);
-        using var muted = new SolidBrush(Theme.Muted);
+        var small = CachedFont(11);
+        var muted = CachedBrush(Theme.Muted);
 
         float lx = r.Right - 18;
         lx = Legend(g, small, "GPU", Theme.Gpu, lx, r.Y + 14);
         Legend(g, small, "CPU", Theme.Cpu, lx - 14, r.Y + 14);
 
         var plot = new RectangleF(r.X + 50, r.Y + 44, r.Width - 50 - 20, r.Height - 44 - 30);
-        using var grid = new Pen(Color.FromArgb(40, 40, 48), 1);
-        using var axisFmt = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
-        foreach (int t in new[] { 40, 60, 80, 100 })
+        for (int i = 0; i < GridTemps.Length; i++)
         {
-            float y = plot.Bottom - (t - TempMin) / (TempMax - TempMin) * plot.Height;
-            g.DrawLine(grid, plot.X, y, plot.Right, y);
-            g.DrawString($"{t}°", small, muted, new RectangleF(r.X + 8, y - 8, 36, 16), axisFmt);
+            float y = plot.Bottom - (GridTemps[i] - TempMin) / (TempMax - TempMin) * plot.Height;
+            g.DrawLine(GridPen, plot.X, y, plot.Right, y);
+            g.DrawString(GridLabels[i], small, muted, new RectangleF(r.X + 8, y - 8, 36, 16), AxisFormat);
         }
 
         int minutes = Math.Max(1, HistoryCapacity / 60);
         g.DrawString($"{minutes} dk önce", small, muted, plot.X - 2, plot.Bottom + 6);
-        using var far = new StringFormat { Alignment = StringAlignment.Far };
-        g.DrawString("şimdi", small, muted, new RectangleF(plot.Right - 60, plot.Bottom + 6, 62, 16), far);
+        g.DrawString("şimdi", small, muted, new RectangleF(plot.Right - 60, plot.Bottom + 6, 62, 16), FarFormat);
 
-        DrawSeries(g, plot, s => s.GpuTemp, Theme.Gpu);
-        DrawSeries(g, plot, s => s.CpuTemp, Theme.Cpu);
+        DrawSeries(g, plot, gpu: true, GpuSeriesPen, Theme.Gpu);
+        DrawSeries(g, plot, gpu: false, CpuSeriesPen, Theme.Cpu);
     }
 
     private static float Legend(Graphics g, Font font, string text, Color color, float right, float y)
     {
         float w = g.MeasureString(text, font).Width;
-        using var mb = new SolidBrush(Theme.Text);
-        g.DrawString(text, font, mb, right - w, y);
-        using var cb = new SolidBrush(color);
-        g.FillEllipse(cb, right - w - 12, y + 4, 8, 8);
+        g.DrawString(text, font, CachedBrush(Theme.Text), right - w, y);
+        g.FillEllipse(CachedBrush(color), right - w - 12, y + 4, 8, 8);
         return right - w - 12;
     }
 
-    private void DrawSeries(Graphics g, RectangleF plot, Func<Snapshot, float?> pick, Color color)
+    private void DrawSeries(Graphics g, RectangleF plot, bool gpu, Pen pen, Color color)
     {
-        if (History.Count < 2) return;
+        var history = History;
+        int count = history.Count;
+        if (count < 2) return;
         int cap = Math.Max(HistoryCapacity, 2);
-        var points = new List<PointF>();
-        int offset = cap - History.Count; // en yeni değer sağ kenarda
-        for (int i = 0; i < History.Count; i++)
+        if (_points.Length < count) _points = new PointF[Math.Max(count, cap)];
+        var points = _points;
+        int n = 0;
+        int offset = cap - count; // en yeni değer sağ kenarda
+        for (int i = 0; i < count; i++)
         {
-            if (pick(History[i]) is not float v) continue;
+            var s = history[i];
+            if ((gpu ? s.GpuTemp : s.CpuTemp) is not float v) continue;
             float x = plot.X + (offset + i) / (float)(cap - 1) * plot.Width;
             float y = plot.Bottom - (Math.Clamp(v, TempMin, TempMax) - TempMin) / (TempMax - TempMin) * plot.Height;
-            points.Add(new PointF(x, y));
+            points[n++] = new PointF(x, y);
         }
-        if (points.Count < 2) return;
-        using var pen = new Pen(color, 2f) { LineJoin = LineJoin.Round };
-        g.DrawLines(pen, points.ToArray());
-        var last = points[^1];
-        using var b = new SolidBrush(color);
-        g.FillEllipse(b, last.X - 3.5f, last.Y - 3.5f, 7, 7);
+        if (n < 2) return;
+        g.DrawLines(pen, points.AsSpan(0, n));
+        var last = points[n - 1];
+        g.FillEllipse(CachedBrush(color), last.X - 3.5f, last.Y - 3.5f, 7, 7);
     }
 
     // ---------------- Bellek ----------------
@@ -186,22 +205,21 @@ public sealed class DashboardView : PanelView
     {
         DrawCard(g, r);
         DrawLabel(g, "Bellek", r.X + 18, r.Y + 14);
-        using var big = Theme.Number(36);
-        using var mid = Theme.Font(13);
-        using var muted = new SolidBrush(Theme.Muted);
-        using var text = new SolidBrush(Theme.Text);
+        var big = CachedNumber(36);
+        var mid = CachedFont(13);
+        var muted = CachedBrush(Theme.Muted);
+        var text = CachedBrush(Theme.Text);
 
         float? pct = Data.RamUsed is float u && Data.RamTotal is float t && t > 0 ? u / t * 100 : null;
         string used = Data.RamUsed.HasValue ? Data.RamUsed.Value.ToString("0.0") : "--";
         g.DrawString(used, big, text, r.X + 14, r.Y + 52);
         float uw = g.MeasureString(used, big).Width;
-        g.DrawString("GB", mid, muted, r.X + 10 + uw, r.Y + 52 + Theme.Ascent(big) - Theme.Ascent(mid));
+        g.DrawString("GB", mid, muted, r.X + 10 + uw, r.Y + 52 + RamUnitOffset);
 
         Theme.Bar(g, new RectangleF(r.X + 20, r.Y + 118, r.Width - 40, 8), pct, Color.FromArgb(176, 176, 190));
         string total = Data.RamTotal.HasValue ? $"Toplam {Data.RamTotal.Value:0.0} GB" : "";
         g.DrawString(total, mid, muted, r.X + 18, r.Y + 138);
-        using var far = new StringFormat { Alignment = StringAlignment.Far };
-        g.DrawString(pct.HasValue ? $"{pct.Value:0}%" : "", mid, text, new RectangleF(r.X, r.Y + 138, r.Width - 18, 20), far);
+        g.DrawString(pct.HasValue ? $"{pct.Value:0}%" : "", mid, text, new RectangleF(r.X, r.Y + 138, r.Width - 18, 20), FarFormat);
     }
 
     // ---------------- Alt satır: oyun paneli modu ----------------
@@ -212,23 +230,15 @@ public sealed class DashboardView : PanelView
         var fan = Data.Fan;
         bool canSwitch = fan.Available && fan.Perf != PerfMode.Bilinmiyor;
         DrawLabel(g, "Performans", 22, 553);
-        Button(g, new RectangleF(124, 544, 92, 34), "Turbo", fan.Perf == PerfMode.Turbo,
-            () => PerfSelected?.Invoke(PerfMode.Turbo), enabled: canSwitch);
-        Button(g, new RectangleF(220, 544, 92, 34), "Dengeli", fan.Perf == PerfMode.Dengeli,
-            () => PerfSelected?.Invoke(PerfMode.Dengeli), enabled: canSwitch, activeColor: Color.FromArgb(52, 96, 150));
+        Button(g, new RectangleF(124, 544, 92, 34), "Turbo", fan.Perf == PerfMode.Turbo, _turbo, enabled: canSwitch);
+        Button(g, new RectangleF(220, 544, 92, 34), "Dengeli", fan.Perf == PerfMode.Dengeli, _balanced,
+            enabled: canSwitch, activeColor: Color.FromArgb(52, 96, 150));
         if (fan.Perf is PerfMode.Sport or PerfMode.Eco)
-        {
-            using var font = Theme.Font(12);
-            using var muted = new SolidBrush(Theme.Muted);
-            g.DrawString($"şu an: {fan.Perf}", font, muted, 320, 553);
-        }
+            g.DrawString($"şu an: {fan.Perf}", CachedFont(12), CachedBrush(Theme.Muted), 320, 553);
 
         // Oyun paneli modu
         DrawLabel(g, "Oyun paneli", 448, 553);
         for (int i = 0; i < Segments.Length; i++)
-        {
-            var (mode, text) = Segments[i];
-            Button(g, new RectangleF(548 + i * 98, 544, 94, 34), text, mode == Mode, () => ModeSelected?.Invoke(mode));
-        }
+            Button(g, new RectangleF(548 + i * 98, 544, 94, 34), Segments[i].text, Segments[i].mode == Mode, _segmentActions[i]);
     }
 }

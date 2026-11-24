@@ -9,6 +9,7 @@ public sealed class DashboardForm : Form
     public FanView Fans { get; }
     public PerfView Perf { get; }
     private readonly PanelView[] _pages;
+    private readonly Icon _icon;
 
     public DashboardForm()
     {
@@ -18,7 +19,7 @@ public sealed class DashboardForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Theme.Background;
         AutoScaleMode = AutoScaleMode.None;
-        Icon = DragonLogo.LoadIcon();
+        Icon = _icon = DragonLogo.LoadIcon();
 
         View = new DashboardView { Dock = DockStyle.Fill };
         Fans = new FanView { Dock = DockStyle.Fill, Visible = false };
@@ -33,7 +34,12 @@ public sealed class DashboardForm : Form
         ApplyScale();
     }
 
-    public bool IsPageVisible(PanelView page) => Visible && page.Visible;
+    /// <summary>
+    /// Sayfa şu an ekranda mı? Pencere gizliyken, simge durumundayken ya da başka sekme açıkken
+    /// yeniden çizime gerek yoktur; veri yine saklanır, pencere açılınca Windows tüm alanı yeniden çizdirir.
+    /// </summary>
+    public bool IsPageVisible(PanelView page) =>
+        Visible && WindowState != FormWindowState.Minimized && page.Visible;
 
     private void ShowPage(int index)
     {
@@ -81,6 +87,13 @@ public sealed class DashboardForm : Form
         if (!Visible) Show();
         if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
         Activate();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        // Form, Icon özelliğine verilen simgeyi kendisi serbest bırakmaz
+        base.Dispose(disposing);
+        if (disposing) _icon.Dispose();
     }
 
     [DllImport("dwmapi.dll")]
