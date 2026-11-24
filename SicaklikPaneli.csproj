@@ -17,6 +17,21 @@
     <ApplicationIcon>DragonSaj.ico</ApplicationIcon>
   </PropertyGroup>
 
+  <!-- Çalışma zamanı ayarları (runtimeconfig.json'a yazılır) -->
+  <PropertyGroup>
+    <!-- Tepsi uygulaması: iş istasyonu GC'si yeterli (varsayılanı açıkça sabitler) -->
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <!-- Yığın birkaç MB olduğundan arka plan GC iş parçacığına gerek yok; bloklayan 2. nesil
+         toplama bu boyutta fark edilmez. Ayrı GC iş parçacığı ve ona ayrılan bellek kalkar. -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- InvariantGlobalization bilerek kapalı: sayılar Türkçe kültürle (ondalık virgül) biçimleniyor -->
+  </PropertyGroup>
+
+  <!-- Paketlerin gereksiz dil klasörleri çıktıya kopyalanmasın -->
+  <PropertyGroup>
+    <SatelliteResourceLanguages>en;tr</SatelliteResourceLanguages>
+  </PropertyGroup>
+
   <ItemGroup>
     <Compile Remove="tools\**" />
     <EmbeddedResource Include="DragonSaj.ico" LogicalName="DragonSaj.ico" />

@@ -11,7 +11,17 @@
   </trustInfo>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
+      <!-- Windows 10 / 11 -->
       <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
     </application>
   </compatibility>
+  <!-- DPI farkındalığı bilerek burada değil: csproj'daki ApplicationHighDpiMode (PerMonitorV2) ile verilir -->
+  <!-- Ortak denetimler v6: ApplicationConfiguration.Initialize'dan önce gösterilen
+       "zaten çalışıyor" iletişim kutusu da güncel görünümle açılsın -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0"
+                        processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
+    </dependentAssembly>
+  </dependency>
 </assembly>
