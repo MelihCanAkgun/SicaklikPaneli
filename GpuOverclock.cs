@@ -15,138 +15,197 @@ public sealed record OcState(bool Available, string Message, OcClock Core, OcClo
 /// MSI Afterburner ve Dragon Center'ın kullandığı NVAPI "Pstates20" arayüzünü kullanır.
 /// Voltaja dokunmaz; ofset kalıcı değildir, yeniden başlatmada sıfırlanır.
 /// </summary>
-public static class GpuOverclock
+public static unsafe class GpuOverclock
 {
     private const uint IdInitialize = 0x0150E828, IdEnumPhysicalGpus = 0xE5AC921F,
                        IdGetPstates20 = 0x6FF81213, IdSetPstates20 = 0x0F4DAE6B;
 
-    // NV_GPU_PERF_PSTATES20_INFO yapı düzeni
+    // NV_GPU_PERF_PSTATES20_INFO yapı düzeni (V2/V3 aynı boyutta)
     private const int SizeV2 = 0x1CF8, HeaderSize = 20, PstateSize = 456, ClockSize = 44;
     private const int OffNumPstates = 8, OffNumClocks = 12, OffClocks = 8;
     private const int ClkDomain = 0, ClkType = 4, ClkEditable = 8, ClkDelta = 12, ClkMin = 16, ClkMax = 20;
     private const uint DomainGraphics = 0, DomainMemory = 4;
-    private static readonly uint[] Versions = { 0x20000 | SizeV2, 0x30000 | SizeV2 };
+    private const uint VersionV2 = 0x20000 | SizeV2, VersionV3 = 0x30000 | SizeV2;
+    private const int MaxPhysicalGpus = 64;
 
-    [DllImport("nvapi64.dll", EntryPoint = "nvapi_QueryInterface", CallingConvention = CallingConvention.Cdecl)]
-    private static extern IntPtr QueryInterface(uint id);
+    // NVAPI dönüş kodları
+    private const int NvApiNotInitialized = -4, NvInvalidHandle = -8, NvHandleInvalidated = -10, NvGpuNotPowered = -220;
 
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int InitializeFn();
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int EnumGpusFn([Out] IntPtr[] handles, out uint count);
-    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate int PstatesFn(IntPtr gpu, IntPtr info);
+    // Sık dönen durumlar her okumada yeniden oluşturulmasın
+    private static readonly OcState Sleeping = OcState.Unavailable("Ekran kartı şu an uykuda. Bir oyun açıkken bu sayfaya tekrar bak.");
+    private static readonly OcState NotSupported = OcState.Unavailable("Ekran kartı hız aşırtmayı desteklemiyor.");
 
-    private static bool _initialized;
+    private static readonly object Sync = new();
+
+    // nvapi64.dll ve işlev işaretçileri bir kez çözülür; GPU tutamacı geçersizleşirse yeniden alınır
+    private static bool _resolved, _permanentFailure;
+    private static delegate* unmanaged[Cdecl]<int> _initialize;
+    private static delegate* unmanaged[Cdecl]<IntPtr*, uint*, int> _enumGpus;
+    private static delegate* unmanaged[Cdecl]<IntPtr, void*, int> _get, _set;
     private static IntPtr _gpu;
-    private static PstatesFn? _get, _set;
     private static uint _version;
     private static string _error = "";
 
+    // Yapı için süreç boyunca tek bir yerel tampon (yalnızca kilit altında kullanılır)
+    private static byte* _buf;
+
+    /// <summary>Kütüphaneyi ve işlevleri çözer (bir kez); ardından gerekiyorsa NVAPI'yi başlatıp GPU tutamacını alır.</summary>
     private static bool EnsureInit()
     {
-        if (_initialized) return _gpu != IntPtr.Zero;
-        _initialized = true;
-        try
+        if (_gpu != IntPtr.Zero) return true;
+        if (_permanentFailure) return false;
+
+        if (!_resolved)
         {
-            T Fn<T>(uint id) where T : Delegate
-            {
-                IntPtr p = QueryInterface(id);
-                if (p == IntPtr.Zero) throw new InvalidOperationException("NVAPI işlevi bulunamadı.");
-                return Marshal.GetDelegateForFunctionPointer<T>(p);
-            }
+            if (!NativeLibrary.TryLoad("nvapi64.dll", typeof(GpuOverclock).Assembly, null, out IntPtr lib))
+                return Fail("NVIDIA sürücüsü bulunamadı.");
+            if (!NativeLibrary.TryGetExport(lib, "nvapi_QueryInterface", out IntPtr qiPtr))
+                return Fail("NVIDIA sürücüsü desteklenmiyor.");
 
-            int rc = Fn<InitializeFn>(IdInitialize)();
-            if (rc != 0) { _error = $"NVAPI başlatılamadı ({rc})."; return false; }
+            var qi = (delegate* unmanaged[Cdecl]<uint, IntPtr>)qiPtr;
+            IntPtr init = qi(IdInitialize), enumGpus = qi(IdEnumPhysicalGpus),
+                   get = qi(IdGetPstates20), set = qi(IdSetPstates20);
+            if (init == IntPtr.Zero || enumGpus == IntPtr.Zero || get == IntPtr.Zero || set == IntPtr.Zero)
+                return Fail("NVAPI işlevi bulunamadı.");
 
-            var handles = new IntPtr[64];
-            rc = Fn<EnumGpusFn>(IdEnumPhysicalGpus)(handles, out uint count);
-            if (rc != 0 || count == 0) { _error = "NVIDIA ekran kartı bulunamadı."; return false; }
-
-            _get = Fn<PstatesFn>(IdGetPstates20);
-            _set = Fn<PstatesFn>(IdSetPstates20);
-            _gpu = handles[0];
-            return true;
+            _initialize = (delegate* unmanaged[Cdecl]<int>)init;
+            _enumGpus = (delegate* unmanaged[Cdecl]<IntPtr*, uint*, int>)enumGpus;
+            _get = (delegate* unmanaged[Cdecl]<IntPtr, void*, int>)get;
+            _set = (delegate* unmanaged[Cdecl]<IntPtr, void*, int>)set;
+            _buf = (byte*)NativeMemory.Alloc(SizeV2);
+            _resolved = true;
         }
-        catch (DllNotFoundException) { _error = "NVIDIA sürücüsü bulunamadı."; return false; }
-        catch (Exception ex) { _error = ex.Message; return false; }
+
+        // Başlatma ya da sayım geçici olarak başarısız olabilir (ör. sürücü yeni yükleniyor); sonraki çağrıda yeniden denenir
+        int rc = _initialize();
+        if (rc != 0) { _error = $"NVAPI başlatılamadı ({rc})."; return false; }
+
+        IntPtr* handles = stackalloc IntPtr[MaxPhysicalGpus];
+        uint count = 0;
+        rc = _enumGpus(handles, &count);
+        if (rc != 0 || count == 0) { _error = "NVIDIA ekran kartı bulunamadı."; return false; }
+
+        _gpu = handles[0];
+        return true;
+
+        static bool Fail(string message)
+        {
+            _permanentFailure = true;
+            _error = message;
+            return false;
+        }
     }
+
+    /// <summary>Tutamaç geçersizleşmişse (ör. sürücü yeniden yüklendi) yeniden almak gerekir.</summary>
+    private static bool IsStaleHandle(int rc) => rc is NvInvalidHandle or NvHandleInvalidated or NvApiNotInitialized;
 
     /// <summary>Geçerli ofsetleri ve sürücünün izin verdiği aralıkları okur.</summary>
     public static OcState Read()
     {
-        if (!EnsureInit()) return OcState.Unavailable(_error);
-        IntPtr buf = Marshal.AllocHGlobal(SizeV2);
-        try
+        lock (Sync)
         {
-            int rc = -1;
-            foreach (uint version in _version != 0 ? new[] { _version } : Versions)
-            {
-                Clear(buf);
-                Marshal.WriteInt32(buf, 0, (int)version);
-                rc = _get!(_gpu, buf);
-                if (rc == 0) { _version = version; break; }
-            }
-            // -220: Optimus dizüstülerde ekran kartı kullanılmadığında uykuya geçer
-            if (rc == -220) return OcState.Unavailable("Ekran kartı şu an uykuda. Bir oyun açıkken bu sayfaya tekrar bak.");
-            if (rc != 0) return OcState.Unavailable($"Hız aşırtma bilgisi okunamadı ({rc}).");
-
-            int numPstates = Marshal.ReadInt32(buf, OffNumPstates);
-            int numClocks = Math.Min(Marshal.ReadInt32(buf, OffNumClocks), 8);
-            if (numPstates < 1) return OcState.Unavailable("Ekran kartı hız aşırtmayı desteklemiyor.");
-
-            OcClock core = default, memory = default;
-            for (int j = 0; j < numClocks; j++)
-            {
-                int o = HeaderSize + OffClocks + j * ClockSize; // en yüksek performans durumu (P0)
-                uint domain = (uint)Marshal.ReadInt32(buf, o + ClkDomain);
-                var clock = new OcClock(
-                    (Marshal.ReadInt32(buf, o + ClkEditable) & 1) != 0,
-                    Marshal.ReadInt32(buf, o + ClkDelta) / 1000,
-                    Marshal.ReadInt32(buf, o + ClkMin) / 1000,
-                    Marshal.ReadInt32(buf, o + ClkMax) / 1000);
-                if (domain == DomainGraphics) core = clock;
-                else if (domain == DomainMemory) memory = clock;
-            }
-            if (!core.Editable && !memory.Editable)
-                return new OcState(false, "Bu ekran kartında hız aşırtma kilitli.", core, memory);
-            return new OcState(true, "", core, memory);
+            try { return ReadLocked(); }
+            catch (Exception ex) { return OcState.Unavailable(ex.Message); }
         }
-        catch (Exception ex) { return OcState.Unavailable(ex.Message); }
-        finally { Marshal.FreeHGlobal(buf); }
+    }
+
+    private static OcState ReadLocked()
+    {
+        if (!EnsureInit()) return OcState.Unavailable(_error);
+
+        int rc = GetInfo();
+        if (IsStaleHandle(rc))
+        {
+            _gpu = IntPtr.Zero;
+            if (!EnsureInit()) return OcState.Unavailable(_error);
+            rc = GetInfo();
+        }
+        // Optimus dizüstülerde ekran kartı kullanılmadığında uykuya geçer
+        if (rc == NvGpuNotPowered) return Sleeping;
+        if (rc != 0) return OcState.Unavailable($"Hız aşırtma bilgisi okunamadı ({rc}).");
+
+        byte* buf = _buf;
+        int numPstates = *(int*)(buf + OffNumPstates);
+        int numClocks = Math.Min(*(int*)(buf + OffNumClocks), 8);
+        if (numPstates < 1) return NotSupported;
+
+        OcClock core = default, memory = default;
+        for (int j = 0; j < numClocks; j++)
+        {
+            byte* c = buf + HeaderSize + OffClocks + j * ClockSize; // en yüksek performans durumu (P0)
+            uint domain = *(uint*)(c + ClkDomain);
+            var clock = new OcClock(
+                (*(int*)(c + ClkEditable) & 1) != 0,
+                *(int*)(c + ClkDelta) / 1000,
+                *(int*)(c + ClkMin) / 1000,
+                *(int*)(c + ClkMax) / 1000);
+            if (domain == DomainGraphics) core = clock;
+            else if (domain == DomainMemory) memory = clock;
+        }
+        if (!core.Editable && !memory.Editable)
+            return new OcState(false, "Bu ekran kartında hız aşırtma kilitli.", core, memory);
+        return new OcState(true, "", core, memory);
+    }
+
+    /// <summary>Yapıyı tampona okur. Sürüm henüz bilinmiyorsa V2, olmazsa V3 denenir.</summary>
+    private static int GetInfo()
+    {
+        if (_version != 0) return GetInfo(_version);
+        int rc = GetInfo(VersionV2);
+        if (rc == 0) { _version = VersionV2; return 0; }
+        rc = GetInfo(VersionV3);
+        if (rc == 0) _version = VersionV3;
+        return rc;
+    }
+
+    private static int GetInfo(uint version)
+    {
+        new Span<byte>(_buf, SizeV2).Clear();
+        *(uint*)_buf = version;
+        return _get(_gpu, _buf);
     }
 
     /// <summary>Çekirdek ve bellek saat ofsetlerini (MHz) ayarlar. Sürücünün aralığı dışına çıkmaz.</summary>
     public static bool Apply(int coreMhz, int memoryMhz, out string error)
     {
-        error = "";
-        var state = Read();
-        if (!state.Available) { error = state.Message; return false; }
+        lock (Sync)
+        {
+            error = "";
+            OcState state;
+            try { state = ReadLocked(); }
+            catch (Exception ex) { error = ex.Message; return false; }
+            if (!state.Available) { error = state.Message; return false; }
 
-        bool ok = true;
-        if (state.Core.Editable)
-            ok &= SetClock(DomainGraphics, Math.Clamp(coreMhz, Math.Min(0, state.Core.MinMhz), state.Core.MaxMhz), ref error);
-        if (state.Memory.Editable)
-            ok &= SetClock(DomainMemory, Math.Clamp(memoryMhz, Math.Min(0, state.Memory.MinMhz), state.Memory.MaxMhz), ref error);
-        return ok;
+            bool ok = true;
+            if (state.Core.Editable)
+                ok &= SetClock(DomainGraphics, ClampOffset(coreMhz, state.Core), ref error);
+            if (state.Memory.Editable)
+                ok &= SetClock(DomainMemory, ClampOffset(memoryMhz, state.Memory), ref error);
+            return ok;
+        }
     }
+
+    /// <summary>Ofseti sürücü aralığına sığdırır; sıfıra (sıfırlama) her zaman izin verilir.
+    /// Sürücü tutarsız bir aralık bildirse bile istisna atmaz.</summary>
+    private static int ClampOffset(int mhz, OcClock clock) =>
+        Math.Clamp(mhz, Math.Min(0, clock.MinMhz), Math.Max(0, clock.MaxMhz));
 
     private static bool SetClock(uint domain, int offsetMhz, ref string error)
     {
-        IntPtr buf = Marshal.AllocHGlobal(SizeV2);
         try
         {
-            Clear(buf);
-            Marshal.WriteInt32(buf, 0, (int)_version);
-            Marshal.WriteInt32(buf, OffNumPstates, 1);
-            Marshal.WriteInt32(buf, OffNumClocks, 1);
-            int o = HeaderSize + OffClocks;
-            Marshal.WriteInt32(buf, o + ClkDomain, (int)domain);
-            Marshal.WriteInt32(buf, o + ClkDelta, offsetMhz * 1000);
-            int rc = _set!(_gpu, buf);
+            byte* buf = _buf;
+            new Span<byte>(buf, SizeV2).Clear();
+            *(uint*)buf = _version;
+            *(int*)(buf + OffNumPstates) = 1;
+            *(int*)(buf + OffNumClocks) = 1;
+            byte* c = buf + HeaderSize + OffClocks;
+            *(uint*)(c + ClkDomain) = domain;
+            *(int*)(c + ClkDelta) = offsetMhz * 1000;
+            int rc = _set(_gpu, buf);
             if (rc != 0) { error = $"Sürücü ofseti kabul etmedi ({rc})."; return false; }
             return true;
         }
         catch (Exception ex) { error = ex.Message; return false; }
-        finally { Marshal.FreeHGlobal(buf); }
     }
-
-    private static unsafe void Clear(IntPtr buf) => new Span<byte>((void*)buf, SizeV2).Clear();
 }

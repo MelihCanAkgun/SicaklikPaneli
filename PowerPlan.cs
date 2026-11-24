@@ -1,31 +1,29 @@
-using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace SicaklikPaneli;
 
 /// <summary>Performans moduna uygun Windows güç planını etkinleştirir.</summary>
-public static class PowerPlan
+public static partial class PowerPlan
 {
     // Windows'un yerleşik güç planları
-    private const string HighPerformance = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
-    private const string Balanced = "381b4222-f694-41f0-9685-ff5bb260df2e";
+    private static readonly Guid HighPerformance = new("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c");
+    private static readonly Guid Balanced = new("381b4222-f694-41f0-9685-ff5bb260df2e");
+
+    // powercfg süreci başlatmak yerine aynı işi yapan Windows işlevi doğrudan çağrılır
+    [LibraryImport("powrprof.dll")]
+    private static partial uint PowerSetActiveScheme(IntPtr userRootPowerKey, in Guid schemeGuid);
 
     public static void Apply(PerfMode mode)
     {
-        string? guid = mode switch
+        Guid guid;
+        switch (mode)
         {
-            PerfMode.Turbo => HighPerformance,
-            PerfMode.Dengeli => Balanced,
-            _ => null
-        };
-        if (guid == null) return;
-        try
-        {
-            using var p = Process.Start(new ProcessStartInfo("powercfg.exe", $"/setactive {guid}")
-            {
-                CreateNoWindow = true, UseShellExecute = false
-            });
-            p?.WaitForExit(5000);
+            case PerfMode.Turbo: guid = HighPerformance; break;
+            case PerfMode.Dengeli: guid = Balanced; break;
+            default: return;
         }
+        // Plan sistemde yoksa (ör. kaldırılmışsa) Windows hata döndürür; powercfg'de olduğu gibi sessizce geçilir
+        try { PowerSetActiveScheme(IntPtr.Zero, in guid); }
         catch { }
     }
 }
