@@ -25,7 +25,14 @@ public sealed class TrayApp : ApplicationContext
     private readonly CancellationTokenSource _cts = new();
     private readonly List<Snapshot> _history = new();
     private IntPtr _lastIconHandle;
+    // Simge yalnızca görünen değer (rakam, çizgi rengi, boyut) değişince yeniden çizilir
+    private string? _iconText;
+    private int _iconColor;
+    private Size _iconSize;
     private bool _warnedNoCpuTemp;
+    private volatile bool _closing;
+    private Task? _sensorTask, _fanTask;
+    private readonly SessionEndingEventHandler _onSessionEnding;
     private int _readCount;
     private volatile bool _rtssActive;
     private readonly bool _rtssInstalled = RtssOsd.FindExe() != null;
@@ -46,6 +53,7 @@ public sealed class TrayApp : ApplicationContext
     public TrayApp()
     {
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        _onSessionEnding = (_, _) => ResetOcOnExit();
         MigrateAutostart();
 
         _overlay = new OverlayForm { Opacity = Math.Clamp(_settings.Opacity, 20, 99) / 100.0 };
@@ -75,8 +83,11 @@ public sealed class TrayApp : ApplicationContext
         _uiTimer.Tick += (_, _) => UpdateOverlayVisibility();
         _uiTimer.Start();
 
-        Task.Run(() => SensorLoop(_cts.Token));
-        Task.Run(() => FanLoop(_cts.Token));
+        // Ömür boyu süren döngüler iş parçacığı havuzunu meşgul etmesin: ayrı (arka plan) iş parçacıkları
+        _sensorTask = Task.Factory.StartNew(() => SensorLoop(_cts.Token), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        _fanTask = Task.Factory.StartNew(() => FanLoop(_cts.Token), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
         // Elle açıldıysa ana pencereyi göster; Windows ile başladıysa simge durumunda kal
         if (!Environment.GetCommandLineArgs().Contains("--gizli", StringComparer.OrdinalIgnoreCase))
@@ -150,7 +161,7 @@ public sealed class TrayApp : ApplicationContext
                 perf.Message = "Önceki oturum düzgün kapanmadığı için hız aşırtma güvenlik amacıyla kapatıldı.";
             }
         }
-        SystemEvents.SessionEnding += (_, _) => ResetOcOnExit();
+        SystemEvents.SessionEnding += _onSessionEnding;
     }
 
     private void ApplyOc(bool enabled, int core, int memory)
@@ -245,7 +256,26 @@ public sealed class TrayApp : ApplicationContext
         if (e.Mode != PowerModes.Resume) return;
         FanCommand(ApplySavedFanSettings);
         // Sürücü uykudan dönüşte ofsetleri sıfırlayabilir; açıksa yeniden uygula
-        _ui.Post(_ => { if (_settings.GpuOcEnabled) ApplyOc(true, _settings.GpuOcCore, _settings.GpuOcMemory); }, null);
+        PostUi(() => { if (_settings.GpuOcEnabled) ApplyOc(true, _settings.GpuOcCore, _settings.GpuOcMemory); });
+    }
+
+    /// <summary>
+    /// İşi arayüz iş parçacığına bekletmeden gönderir. Kapanış başladıysa ya da arayüz artık
+    /// ileti alamıyorsa (pencereler yok edilmiş) sessizce bırakır; arka plan döngüsü bundan etkilenmez.
+    /// </summary>
+    private void PostUi(Action action)
+    {
+        if (_closing) return;
+        try
+        {
+            _ui.Post(static state =>
+            {
+                var (app, work) = ((TrayApp, Action))state!;
+                if (app._closing) return;
+                work();
+            }, (this, action));
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
     }
 
     // ---------------- Sensör okuma (arka planda) ----------------
@@ -265,30 +295,45 @@ public sealed class TrayApp : ApplicationContext
             _fanState = fan.State;
 
             var waitHandles = new[] { ct.WaitHandle, _wake };
+            bool loggedError = false;
             while (!ct.IsCancellationRequested)
             {
-                bool ran = false;
-                while (_fanCommands.TryDequeue(out var command))
+                // Tek bir turdaki beklenmeyen hata döngüyü (ve fan denetimini) öldürmesin
+                try
                 {
-                    try { command.run(fan); } catch { }
-                    done = command.seq;
-                    ran = true;
+                    bool ran = false;
+                    while (_fanCommands.TryDequeue(out var command))
+                    {
+                        try { command.run(fan); }
+                        catch (Exception ex) { HataGunlugu.Write("Fan komutu", ex); }
+                        done = command.seq;
+                        ran = true;
+                    }
+
+                    var sensors = _lastSensors;
+                    fan.Tick(sensors.CpuTemp, sensors.GpuTemp, _settings.FanProtection, _settings.FanProtectionTemp);
+                    _fanState = fan.State with { CommandSeq = done };
+
+                    // Komut sonucu sensör döngüsünü beklemeden arayüze gitsin
+                    if (ran)
+                    {
+                        var state = _fanState;
+                        PostUi(() => OnFanState(state));
+                    }
+                    loggedError = false;
                 }
-
-                var sensors = _lastSensors;
-                fan.Tick(sensors.CpuTemp, sensors.GpuTemp, _settings.FanProtection, _settings.FanProtectionTemp);
-                _fanState = fan.State with { CommandSeq = done };
-
-                // Komut sonucu sensör döngüsünü beklemeden arayüze gitsin
-                if (ran)
+                catch (Exception ex)
                 {
-                    var state = _fanState;
-                    _ui.Post(_ => OnFanState(state), null);
+                    if (!loggedError) HataGunlugu.Write("Fan döngüsü", ex);
+                    loggedError = true;
                 }
                 WaitHandle.WaitAny(waitHandles, 1000);
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            HataGunlugu.Write("Fan döngüsü durdu", ex);
+        }
         finally
         {
             fan?.Dispose();
@@ -303,36 +348,54 @@ public sealed class TrayApp : ApplicationContext
             sensors = new Sensors();
 
             int tick = 0;
+            bool readFailed = false, loopFailed = false;
             while (!ct.IsCancellationRequested)
             {
-                Snapshot snap;
-                try { snap = sensors.Read(); }
-                catch { snap = Snapshot.Empty; }
-
-                _lastSensors = snap;
-                snap = snap with { Fan = _fanState };
-
-                // Oyun içi gösterge (RTSS): özel tam ekranda da görünür
-                if (_settings.Mode != PanelMode.Kapali)
+                // Tek bir turdaki beklenmeyen hata (ör. RTSS) sensör döngüsünü öldürmesin
+                try
                 {
-                    if (tick % 30 == 0) RtssOsd.EnsureStarted(); // RTSS kapalıysa başlat
-                    _rtssActive = RtssOsd.Update(RtssOsd.Format(snap));
-                }
-                else if (_rtssActive)
-                {
-                    RtssOsd.Release();
-                    _rtssActive = false;
-                }
-                tick++;
+                    Snapshot snap;
+                    try { snap = sensors.Read(); readFailed = false; }
+                    catch (Exception ex)
+                    {
+                        if (!readFailed) HataGunlugu.Write("Sensör okuma", ex);
+                        readFailed = true;
+                        snap = Snapshot.Empty;
+                    }
 
-                _ui.Post(_ => OnData(snap), null);
+                    _lastSensors = snap;
+                    snap = snap with { Fan = _fanState };
+
+                    // Oyun içi gösterge (RTSS): özel tam ekranda da görünür
+                    if (_settings.Mode != PanelMode.Kapali)
+                    {
+                        // RTSS kapalıysa başlat. Bağlıysa zaten çalışıyordur; süreç listesini taramaya gerek yok.
+                        if (tick % 30 == 0 && !_rtssActive) RtssOsd.EnsureStarted();
+                        _rtssActive = RtssOsd.Update(RtssOsd.Format(snap));
+                    }
+                    else if (_rtssActive)
+                    {
+                        RtssOsd.Release();
+                        _rtssActive = false;
+                    }
+                    tick++;
+
+                    PostUi(() => OnData(snap));
+                    loopFailed = false;
+                }
+                catch (Exception ex)
+                {
+                    if (!loopFailed) HataGunlugu.Write("Sensör döngüsü", ex);
+                    loopFailed = true;
+                }
                 ct.WaitHandle.WaitOne(1000);
             }
         }
         catch (Exception ex)
         {
-            _ui.Post(_ => MessageBox.Show("Sensörler açılamadı:\n" + ex.Message, "Dragon Saj",
-                MessageBoxButtons.OK, MessageBoxIcon.Error), null);
+            HataGunlugu.Write("Sensörler açılamadı", ex);
+            PostUi(() => MessageBox.Show("Sensörler açılamadı:\n" + ex.Message, "Dragon Saj",
+                MessageBoxButtons.OK, MessageBoxIcon.Error));
         }
         finally
         {
@@ -410,6 +473,17 @@ public sealed class TrayApp : ApplicationContext
     private void UpdateTrayIcon(Snapshot? s)
     {
         var size = SystemInformation.SmallIconSize;
+        string text = s?.CpuTemp is float t ? Math.Min(t, 99).ToString("0") : "--";
+        bool throttle = s is { CpuThrottle: true } or { GpuThrottle: true };
+        Color barColor = throttle ? Theme.Warning : Theme.TempColor(s?.CpuTemp);
+
+        // Görünen hiçbir şey değişmediyse yeni simge üretme (GDI tutamacı ve kabuk güncellemesi tasarrufu)
+        if (_lastIconHandle != IntPtr.Zero && text == _iconText && barColor.ToArgb() == _iconColor && size == _iconSize)
+            return;
+        _iconText = text;
+        _iconColor = barColor.ToArgb();
+        _iconSize = size;
+
         using var bmp = new Bitmap(size.Width, size.Height);
         using (var g = Graphics.FromImage(bmp))
         {
@@ -418,7 +492,6 @@ public sealed class TrayApp : ApplicationContext
             g.SmoothingMode = SmoothingMode.AntiAlias;
             int w = size.Width, h = size.Height;
             int bar = Math.Max(2, h / 8);
-            string text = s?.CpuTemp is float t ? Math.Min(t, 99).ToString("0") : "--";
 
             using var path = new GraphicsPath();
             using var family = new FontFamily("Arial");
@@ -437,8 +510,7 @@ public sealed class TrayApp : ApplicationContext
             g.FillPath(Brushes.White, path);
 
             g.SmoothingMode = SmoothingMode.None;
-            bool throttle = s is { CpuThrottle: true } or { GpuThrottle: true };
-            using var barBrush = new SolidBrush(throttle ? Theme.Warning : Theme.TempColor(s?.CpuTemp));
+            using var barBrush = new SolidBrush(barColor);
             g.FillRectangle(barBrush, 0, h - bar, w, bar);
         }
 
@@ -454,7 +526,9 @@ public sealed class TrayApp : ApplicationContext
 
     private void UpdateOverlayVisibility()
     {
-        bool fullscreen = Native.IsForegroundFullscreen(out Screen? screen);
+        // Panel kapalıyken ön plan penceresini sorgulamaya gerek yok
+        Screen? screen = null;
+        bool fullscreen = _settings.Mode != PanelMode.Kapali && Native.IsForegroundFullscreen(out screen);
         // RTSS bağlıysa oyundaki göstergeyi o çizer; pencere panelini tam ekranda gizle (çift görünmesin)
         bool show = _settings.Mode switch
         {
@@ -568,7 +642,26 @@ public sealed class TrayApp : ApplicationContext
 
     // ---------------- Otomatik başlatma (yönetici izniyle, Görev Zamanlayıcı) ----------------
 
-    private static bool IsAutostartEnabled() => RunSchtasks($"/query /tn \"{TaskName}\"") == 0;
+    private static bool IsAutostartEnabled() => TaskExists(TaskName);
+
+    /// <summary>
+    /// Görev kayıtlı mı? Görev Zamanlayıcı kök klasördeki her görev için TaskCache\Tree altında bir anahtar tutar;
+    /// yönetici olarak bu anahtara bakmak her açılışta schtasks süreci başlatmaktan çok daha ucuzdur.
+    /// Anahtar okunamazsa (izin yok vb.) eskisi gibi schtasks'a sorulur.
+    /// </summary>
+    private static bool TaskExists(string name)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\" + name);
+            return key != null;
+        }
+        catch
+        {
+            return RunSchtasks($"/query /tn \"{name}\"") == 0;
+        }
+    }
 
     private static int CreateAutostartTask() =>
         RunSchtasks($"/create /tn \"{TaskName}\" /tr \"\\\"{Environment.ProcessPath}\\\" --gizli\" /sc onlogon /rl highest /f");
@@ -576,7 +669,7 @@ public sealed class TrayApp : ApplicationContext
     /// <summary>Eski adla (Sıcaklık Paneli) kurulmuş otomatik başlatma görevini yeni ada ve exe'ye taşır.</summary>
     private static void MigrateAutostart()
     {
-        if (RunSchtasks($"/query /tn \"{OldTaskName}\"") != 0) return;
+        if (!TaskExists(OldTaskName)) return;
         if (CreateAutostartTask() == 0)
             RunSchtasks($"/delete /tn \"{OldTaskName}\" /f");
     }
@@ -610,18 +703,37 @@ public sealed class TrayApp : ApplicationContext
 
     protected override void ExitThreadCore()
     {
+        if (_closing) return; // ikinci çağrı (ör. Windows kapanırken): her şey zaten bırakıldı
+        _closing = true; // bundan sonra arka plandan gelen arayüz işleri yapılmaz
+
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
-        ResetOcOnExit();
-        _cts.Cancel();
+        SystemEvents.SessionEnding -= _onSessionEnding;
         _uiTimer.Stop();
+        ResetOcOnExit();
+
+        // Döngülerin bitmesini kısa süre bekle: fan denetleyicisi (korumanın açtığı tam hızı bırakır)
+        // ve sensörler süreç bitmeden düzgün kapansın, RTSS girdisi de silindikten sonra yeniden yazılmasın.
+        _cts.Cancel();
+        try
+        {
+            var loops = new[] { _sensorTask, _fanTask }.OfType<Task>().ToArray();
+            if (!Task.WaitAll(loops, TimeSpan.FromSeconds(3)))
+                HataGunlugu.Write("Kapanışta arka plan döngüleri zamanında bitmedi.");
+        }
+        catch (Exception ex) { HataGunlugu.Write("Kapanış", ex); }
+
         RtssOsd.Release();
         Native.UnregisterHotKey(_hotkeys.Handle, HotkeyId);
         _hotkeys.DestroyHandle();
+        _uiTimer.Dispose();
+        var menu = _tray.ContextMenuStrip;
         _tray.Visible = false;
         _tray.Dispose();
+        menu?.Dispose();
         _overlay.Close();
         _dashboard.Dispose();
         if (_lastIconHandle != IntPtr.Zero) Native.DestroyIcon(_lastIconHandle);
+        _lastIconHandle = IntPtr.Zero;
         base.ExitThreadCore();
     }
 
